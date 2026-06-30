@@ -1,5 +1,4 @@
 import json
-import re
 from datetime import date, datetime, timedelta
 from io import BytesIO
 
@@ -21,33 +20,24 @@ st.set_page_config(
 
 
 # =========================================================
-# NOMES PADRÃO ESPERADOS NO RETORNO DA QUERY DA EMPRESA
-# A query da empresa precisa retornar pelo menos: PEDIDO
-# Recomendo retornar também: FORNECEDOR, LOJA, VALOR, DEPARTAMENTO,
-# NOME_ARQUIVO, DATA_IMPORTACAO, STATUS_BANCO, COD_STATUS_BANCO
+# COLUNAS PADRÃO QUE A QUERY ABAIXO RETORNA
 # =========================================================
 
 COLUNA_PEDIDO = "PEDIDO"
 COLUNA_FORNECEDOR = "FORNECEDOR"
-COLUNA_LOJA = "LOJA"
-COLUNA_VALOR = "VALOR"
+COLUNA_LOJA = "FILIAL"
+COLUNA_VALOR = "VALOR_TOTAL"
 COLUNA_DEPARTAMENTO = "DEPARTAMENTO"
 COLUNA_NOME_ARQUIVO = "NOME_ARQUIVO"
-COLUNA_DATA_IMPORTACAO = "DATA_IMPORTACAO"
+COLUNA_DATA = "DT_EMISSAO"
 
-VALORES_STATUS_LIBERADO = {
-    "L",
-    "LIBERADO",
-    "LIBERADA",
-    "APROVADO",
-    "APROVADA",
-    "S",
-    "SIM",
-}
+VALORES_STATUS_LIBERADO = {"L", "LIBERADO", "LIBERADA", "APROVADO", "APROVADA", "S", "SIM"}
 
 
 # =========================================================
 # ANALISTAS E DEPARTAMENTOS FIXOS
+# O usuário escolhe o analista e o app já traz os departamentos dele marcados,
+# mas o campo Departamento é MULTISELECT e permite escolher outros também.
 # =========================================================
 
 ANALISTAS = {
@@ -75,8 +65,21 @@ ANALISTAS = {
     ],
 }
 
+
+def get_todos_departamentos():
+    departamentos = []
+    for lista in ANALISTAS.values():
+        for depto in lista:
+            if depto not in departamentos:
+                departamentos.append(depto)
+    return sorted(departamentos)
+
+
+TODOS_DEPARTAMENTOS = get_todos_departamentos()
+
+
 # =========================================================
-# CSS VISUAL
+# VISUAL
 # =========================================================
 
 st.markdown(
@@ -93,10 +96,10 @@ st.markdown(
             font-size: 15px;
             margin-bottom: 20px;
         }
-        .card-info {
+        div[data-testid="stMetric"] {
             border: 1px solid rgba(255,255,255,0.10);
-            border-radius: 14px;
-            padding: 16px;
+            border-radius: 12px;
+            padding: 12px;
             background: rgba(255,255,255,0.03);
         }
     </style>
@@ -184,15 +187,24 @@ def formatar_moeda(valor):
 
 
 
-def detectar_binds(sql):
-    # Captura binds Oracle no formato :data_ini, :data_fim, :departamento, :nome_arquivo
-    return set(re.findall(r":([A-Za-z_][A-Za-z0-9_]*)", sql or ""))
+def fmt_data_protheus(dt):
+    return dt.strftime("%Y%m%d")
 
 
 
-def filtrar_params_sql(sql, params):
-    binds = detectar_binds(sql)
-    return {k: v for k, v in params.items() if k in binds}
+def parse_enabled(valor):
+    return str(valor).strip().lower() in {"true", "1", "sim", "s", "yes", "y"}
+
+
+
+def preparar_sql_departamentos(departamentos, params):
+    """Cria placeholders Oracle para MULTISELECT de departamentos."""
+    placeholders = []
+    for i, depto in enumerate(departamentos):
+        chave = f"depto_{i}"
+        placeholders.append(f":{chave}")
+        params[chave] = depto
+    return ", ".join(placeholders)
 
 
 # =========================================================
@@ -281,23 +293,12 @@ def criar_tabelas_neon():
         UNIQUE (pedido, loja)
     );
 
-    ALTER TABLE cargas_importacao
-    ADD COLUMN IF NOT EXISTS departamento TEXT;
-
-    ALTER TABLE cargas_importacao
-    ADD COLUMN IF NOT EXISTS filtro_data_ini DATE;
-
-    ALTER TABLE cargas_importacao
-    ADD COLUMN IF NOT EXISTS filtro_data_fim DATE;
-
-    ALTER TABLE pedidos_importados
-    ADD COLUMN IF NOT EXISTS departamento TEXT;
-
-    ALTER TABLE pedidos_importados
-    ADD COLUMN IF NOT EXISTS nome_arquivo_origem TEXT;
-
-    ALTER TABLE pedidos_liberados_historico
-    ADD COLUMN IF NOT EXISTS departamento TEXT;
+    ALTER TABLE cargas_importacao ADD COLUMN IF NOT EXISTS departamento TEXT;
+    ALTER TABLE cargas_importacao ADD COLUMN IF NOT EXISTS filtro_data_ini DATE;
+    ALTER TABLE cargas_importacao ADD COLUMN IF NOT EXISTS filtro_data_fim DATE;
+    ALTER TABLE pedidos_importados ADD COLUMN IF NOT EXISTS departamento TEXT;
+    ALTER TABLE pedidos_importados ADD COLUMN IF NOT EXISTS nome_arquivo_origem TEXT;
+    ALTER TABLE pedidos_liberados_historico ADD COLUMN IF NOT EXISTS departamento TEXT;
     """
 
     try:
@@ -328,10 +329,10 @@ def empresa_habilitada():
     if cfg is None:
         return False, "Configuração [empresa_oracle] não encontrada nos Secrets."
 
-    if not bool(cfg.get("enabled", False)):
+    if not parse_enabled(cfg.get("enabled", False)):
         return False, "Banco da empresa está com enabled = false nos Secrets."
 
-    campos = ["user", "password", "dsn", "query_arquivos", "query_pedidos"]
+    campos = ["user", "password", "dsn"]
     faltando = [c for c in campos if not cfg.get(c)]
     if faltando:
         return False, f"Configuração incompleta em [empresa_oracle]. Faltando: {', '.join(faltando)}"
@@ -378,8 +379,7 @@ def executar_query_empresa(sql, params):
 
     try:
         conn = get_oracle_connection(cfg.get("user"), cfg.get("password"), cfg.get("dsn"))
-        params_usados = filtrar_params_sql(sql, params)
-        df = pd.read_sql(sql, conn, params=params_usados)
+        df = pd.read_sql(sql, conn, params=params)
         df.columns = [str(c).strip().upper() for c in df.columns]
         return df
     except Exception as e:
@@ -388,41 +388,135 @@ def executar_query_empresa(sql, params):
         return pd.DataFrame()
 
 
+# =========================================================
+# QUERY CHUMBADA DO BANCO DA EMPRESA
+# Baseada na query enviada. Corrigi o alias LIBERADO? para STATUS_BANCO/COD_STATUS_BANCO
+# e usei C7_CONAPRO, que também está no WHERE.
+# =========================================================
 
-def carregar_departamentos(data_ini, data_fim):
-    cfg = get_empresa_cfg()
-    if cfg is None or not cfg.get("query_departamentos"):
-        return []
 
+def sql_base_from_where(depto_placeholders, incluir_arquivo=False):
+    filtro_arquivo = ""
+    if incluir_arquivo:
+        filtro_arquivo = "\n  AND TRIM(BG.ZBG_NOMEAR) = :nome_arquivo"
+
+    return f"""
+FROM SC7010 C7
+LEFT JOIN (
+    SELECT DISTINCT
+        ZBG_TIPO,
+        ZBG_PEDPAI,
+        ZBG_FILORI,
+        ZBG_FILDES,
+        ZBG_CODPRO,
+        ZBG_PEDVEN,
+        ZBG_NOMEAR
+    FROM TOTVS.ZBG010 BG
+    WHERE BG.D_E_L_E_T_ = ' '
+) BG ON
+    BG.ZBG_PEDPAI = C7.C7_NUM
+    AND BG.ZBG_CODPRO = C7.C7_PRODUTO
+LEFT JOIN SB1010 B1 ON
+    B1.B1_FILIAL = '    '
+    AND B1.B1_COD = C7.C7_PRODUTO
+    AND B1.D_E_L_E_T_ = ' '
+LEFT JOIN SA2010 A2 ON
+    A2.A2_FILIAL = '    '
+    AND A2.A2_COD = C7.C7_FORNECE
+    AND A2.A2_LOJA = C7.C7_LOJA
+    AND A2.D_E_L_E_T_ = ' '
+WHERE C7.D_E_L_E_T_ = ' '
+  AND C7.C7_XTPPED IN ('Q','D','B')
+  AND C7.C7_RESIDUO = ' '
+  AND C7.C7_CONAPRO IN ('L','B')
+  AND C7.C7_EMISSAO >= :data_ini_yyyymmdd
+  AND C7.C7_EMISSAO <= :data_fim_yyyymmdd
+  AND TRIM(B1.B1_XGCDDE) IN ({depto_placeholders})
+  AND TRIM(BG.ZBG_NOMEAR) IS NOT NULL
+  {filtro_arquivo}
+"""
+
+
+
+def montar_query_arquivos(departamentos, data_ini, data_fim):
     params = {
-        "data_ini": data_ini.strftime("%Y-%m-%d"),
-        "data_fim": data_fim.strftime("%Y-%m-%d"),
+        "data_ini_yyyymmdd": fmt_data_protheus(data_ini),
+        "data_fim_yyyymmdd": fmt_data_protheus(data_fim),
     }
-    df = executar_query_empresa(cfg.get("query_departamentos"), params)
+    depto_placeholders = preparar_sql_departamentos(departamentos, params)
 
-    if df.empty:
-        return []
+    sql = f"""
+SELECT
+    TRIM(BG.ZBG_NOMEAR) AS NOME_ARQUIVO,
+    COUNT(DISTINCT C7.C7_NUM) AS QTD_PEDIDOS,
+    COUNT(DISTINCT CASE WHEN C7.C7_CONAPRO = 'L' THEN C7.C7_NUM END) AS QTD_LIBERADOS,
+    COUNT(DISTINCT CASE WHEN C7.C7_CONAPRO = 'B' THEN C7.C7_NUM END) AS QTD_BLOQUEADOS,
+    MIN(C7.C7_EMISSAO) AS PRIMEIRA_EMISSAO,
+    MAX(C7.C7_EMISSAO) AS ULTIMA_EMISSAO
+{sql_base_from_where(depto_placeholders, incluir_arquivo=False)}
+GROUP BY TRIM(BG.ZBG_NOMEAR)
+ORDER BY MAX(C7.C7_EMISSAO) DESC, TRIM(BG.ZBG_NOMEAR)
+"""
+    return sql, params
 
-    col = "DEPARTAMENTO" if "DEPARTAMENTO" in df.columns else df.columns[0]
-    valores = sorted([limpar_texto(v) for v in df[col].dropna().unique().tolist() if limpar_texto(v)])
-    return valores
 
 
-
-def carregar_arquivos_empresa(data_ini, data_fim, departamento):
-    cfg = get_empresa_cfg()
+def montar_query_pedidos(departamentos, data_ini, data_fim, nome_arquivo):
     params = {
-        "data_ini": data_ini.strftime("%Y-%m-%d"),
-        "data_fim": data_fim.strftime("%Y-%m-%d"),
-        "departamento": departamento,
+        "data_ini_yyyymmdd": fmt_data_protheus(data_ini),
+        "data_fim_yyyymmdd": fmt_data_protheus(data_fim),
+        "nome_arquivo": nome_arquivo,
     }
-    df = executar_query_empresa(cfg.get("query_arquivos"), params)
+    depto_placeholders = preparar_sql_departamentos(departamentos, params)
+
+    sql = f"""
+SELECT
+    CASE
+        WHEN BG.ZBG_TIPO = '1' THEN 'TIPO_FORNECEDOR'
+        WHEN BG.ZBG_TIPO = '2' THEN 'TIPO_LOJA'
+        ELSE 'NAOMISTO'
+    END AS TIPO,
+    C7.C7_FILIAL AS FILIAL,
+    C7.C7_NUM AS PEDIDO,
+    (A2.A2_COD || '/' || A2.A2_LOJA || ' - ' || A2.A2_NREDUZ) AS FORNECEDOR,
+    TRIM(B1.B1_XGCDDE) AS DEPARTAMENTO,
+    BG.ZBG_PEDVEN AS PEDIDO_CROSS,
+    BG.ZBG_FILDES AS FILIAL_CROSS,
+    TRIM(C7.C7_PRODUTO) AS PRODUTO,
+    C7.C7_DESCRI AS DESCRICAO,
+    C7.C7_QUANT AS QUANTIDADE,
+    C7.C7_PRECO AS VALOR_UNITARIO,
+    C7.C7_TOTAL AS VALOR_TOTAL,
+    C7.C7_EMISSAO AS DT_EMISSAO,
+    CASE
+        WHEN C7.C7_CONAPRO = 'L' THEN 'LIBERADO'
+        WHEN C7.C7_CONAPRO = 'B' THEN 'BLOQUEADO'
+        ELSE 'NÃO LIBERADO'
+    END AS STATUS_BANCO,
+    C7.C7_CONAPRO AS COD_STATUS_BANCO,
+    TRIM(BG.ZBG_NOMEAR) AS NOME_ARQUIVO
+{sql_base_from_where(depto_placeholders, incluir_arquivo=True)}
+ORDER BY
+    TRIM(B1.B1_XGCDDE),
+    C7.C7_NUM,
+    TRIM(C7.C7_PRODUTO)
+"""
+    return sql, params
+
+
+
+def carregar_arquivos_empresa(data_ini, data_fim, departamentos):
+    if not departamentos:
+        return pd.DataFrame()
+
+    sql, params = montar_query_arquivos(departamentos, data_ini, data_fim)
+    df = executar_query_empresa(sql, params)
 
     if df.empty:
         return df
 
     if COLUNA_NOME_ARQUIVO not in df.columns:
-        st.error("A query_arquivos precisa retornar a coluna NOME_ARQUIVO.")
+        st.error("A consulta precisa retornar a coluna NOME_ARQUIVO.")
         return pd.DataFrame()
 
     df[COLUNA_NOME_ARQUIVO] = df[COLUNA_NOME_ARQUIVO].apply(limpar_texto)
@@ -431,47 +525,36 @@ def carregar_arquivos_empresa(data_ini, data_fim, departamento):
 
 
 
-def carregar_pedidos_empresa(data_ini, data_fim, departamento, nome_arquivo):
-    cfg = get_empresa_cfg()
-    params = {
-        "data_ini": data_ini.strftime("%Y-%m-%d"),
-        "data_fim": data_fim.strftime("%Y-%m-%d"),
-        "departamento": departamento,
-        "nome_arquivo": nome_arquivo,
-    }
-    df = executar_query_empresa(cfg.get("query_pedidos"), params)
+def carregar_pedidos_empresa(data_ini, data_fim, departamentos, nome_arquivo):
+    if not departamentos or not nome_arquivo:
+        return pd.DataFrame()
+
+    sql, params = montar_query_pedidos(departamentos, data_ini, data_fim, nome_arquivo)
+    df = executar_query_empresa(sql, params)
 
     if df.empty:
         return df
 
     if COLUNA_PEDIDO not in df.columns:
-        st.error("A query_pedidos precisa retornar a coluna PEDIDO.")
+        st.error("A consulta precisa retornar a coluna PEDIDO.")
         return pd.DataFrame()
 
     df[COLUNA_PEDIDO] = df[COLUNA_PEDIDO].apply(limpar_texto)
     df = df[df[COLUNA_PEDIDO] != ""].copy()
 
+    # Padronizações para o Neon e métricas.
     if COLUNA_FORNECEDOR not in df.columns:
         df[COLUNA_FORNECEDOR] = ""
-
     if COLUNA_LOJA not in df.columns:
         df[COLUNA_LOJA] = "GERAL"
-
     if COLUNA_VALOR not in df.columns:
         df[COLUNA_VALOR] = None
-
     if COLUNA_DEPARTAMENTO not in df.columns:
-        df[COLUNA_DEPARTAMENTO] = departamento
-
+        df[COLUNA_DEPARTAMENTO] = ""
     if COLUNA_NOME_ARQUIVO not in df.columns:
         df[COLUNA_NOME_ARQUIVO] = nome_arquivo
-
     if "STATUS_BANCO" not in df.columns:
-        if "COD_STATUS_BANCO" in df.columns:
-            df["STATUS_BANCO"] = df["COD_STATUS_BANCO"].apply(normalizar_status)
-        else:
-            df["STATUS_BANCO"] = "PENDENTE CONSULTA"
-
+        df["STATUS_BANCO"] = df.get("COD_STATUS_BANCO", "").apply(normalizar_status)
     if "COD_STATUS_BANCO" not in df.columns:
         df["COD_STATUS_BANCO"] = df["STATUS_BANCO"]
 
@@ -483,6 +566,8 @@ def carregar_pedidos_empresa(data_ini, data_fim, departamento, nome_arquivo):
     df["STATUS_BANCO"] = df["STATUS_BANCO"].apply(normalizar_status)
     df["COD_STATUS_BANCO"] = df["COD_STATUS_BANCO"].apply(limpar_texto)
 
+    # Remove apenas linhas 100% repetidas, sem perder produtos diferentes do mesmo pedido.
+    df = df.drop_duplicates().copy()
     return df
 
 
@@ -497,9 +582,10 @@ def salvar_carga_no_neon(df_final, nome_carga, nome_arquivo, usuario_importacao,
         st.error("Neon/PostgreSQL não configurado. Verifique os Secrets.")
         return False
 
-    qtd_pedidos = len(df_final)
-    qtd_liberados = int((df_final["STATUS_BANCO"] == "LIBERADO").sum())
-    qtd_nao_liberados = qtd_pedidos - qtd_liberados
+    qtd_pedidos = int(df_final[COLUNA_PEDIDO].nunique()) if COLUNA_PEDIDO in df_final.columns else len(df_final)
+    pedidos_liberados = df_final.loc[df_final["STATUS_BANCO"] == "LIBERADO", COLUNA_PEDIDO].nunique()
+    qtd_liberados = int(pedidos_liberados)
+    qtd_nao_liberados = max(qtd_pedidos - qtd_liberados, 0)
 
     try:
         with engine.begin() as conn:
@@ -608,7 +694,7 @@ def salvar_carga_no_neon(df_final, nome_carga, nome_arquivo, usuario_importacao,
 
 
 # =========================================================
-# CONSULTAS HISTÓRICO NEON
+# HISTÓRICO NEON
 # =========================================================
 
 
@@ -679,7 +765,7 @@ def carregar_historico_liberados_neon():
 
 st.markdown('<div class="titulo-principal">📦 Liberação de Pedidos</div>', unsafe_allow_html=True)
 st.markdown(
-    '<div class="subtitulo">Leia os pedidos direto do banco da empresa por data, departamento e nome do arquivo importado. Depois salve o histórico no Neon/PostgreSQL.</div>',
+    '<div class="subtitulo">Consulta direto no banco da empresa por data, analista, múltiplos departamentos e nome do arquivo importado. Depois salva o histórico no Neon/PostgreSQL.</div>',
     unsafe_allow_html=True,
 )
 
@@ -716,7 +802,7 @@ with aba_consulta:
     st.subheader("1. Filtros para buscar os arquivos importados")
 
     hoje = date.today()
-    col_data1, col_data2, col_analista, col_depto = st.columns([1, 1, 1.1, 1.6])
+    col_data1, col_data2, col_analista = st.columns([1, 1, 1.2])
 
     with col_data1:
         data_ini = st.date_input("Data inicial", value=hoje - timedelta(days=30), format="DD/MM/YYYY")
@@ -727,24 +813,42 @@ with aba_consulta:
     with col_analista:
         analista = st.selectbox("Analista", options=list(ANALISTAS.keys()))
 
-    with col_depto:
-        departamentos_analista = ANALISTAS.get(analista, [])
-        departamento = st.selectbox("Departamento", options=departamentos_analista)
+    departamentos_analista = ANALISTAS.get(analista, [])
+    departamentos_selecionados = st.multiselect(
+        "Departamento",
+        options=TODOS_DEPARTAMENTOS,
+        default=departamentos_analista,
+        help="Multi seleção: os departamentos do analista já vêm marcados, mas você pode incluir/remover qualquer outro departamento.",
+    )
+
+    departamento_carga = "; ".join(departamentos_selecionados)
 
     if data_ini > data_fim:
         st.error("A data inicial não pode ser maior que a data final.")
         st.stop()
 
-    buscar = st.button("🔎 Buscar arquivos importados", type="primary", disabled=not ok_empresa)
+    if not departamentos_selecionados:
+        st.warning("Selecione pelo menos um departamento para buscar os arquivos.")
+
+    buscar = st.button(
+        "🔎 Buscar arquivos importados",
+        type="primary",
+        disabled=(not ok_empresa or not departamentos_selecionados),
+    )
 
     if buscar:
         with st.spinner("Buscando arquivos importados no banco da empresa..."):
-            st.session_state["df_arquivos_empresa"] = carregar_arquivos_empresa(data_ini, data_fim, departamento)
+            st.session_state["df_arquivos_empresa"] = carregar_arquivos_empresa(
+                data_ini,
+                data_fim,
+                departamentos_selecionados,
+            )
             st.session_state["filtros_arquivos"] = {
                 "data_ini": data_ini,
                 "data_fim": data_fim,
                 "analista": analista,
-                "departamento": departamento,
+                "departamentos": departamentos_selecionados,
+                "departamento": departamento_carga,
             }
 
     df_arquivos = st.session_state.get("df_arquivos_empresa", pd.DataFrame())
@@ -756,19 +860,28 @@ with aba_consulta:
         arquivos = df_arquivos[COLUNA_NOME_ARQUIVO].dropna().astype(str).drop_duplicates().tolist()
         nome_arquivo = st.selectbox("Nome do arquivo importado", options=arquivos)
 
-        nome_carga_sugerido = f"{analista} - {departamento} - {nome_arquivo} - {data_ini.strftime('%d/%m/%Y')} a {data_fim.strftime('%d/%m/%Y')}"
+        nome_carga_sugerido = (
+            f"{analista} - {departamento_carga} - {nome_arquivo} - "
+            f"{data_ini.strftime('%d/%m/%Y')} a {data_fim.strftime('%d/%m/%Y')}"
+        )
         nome_carga = st.text_input("Nome para salvar no histórico do Neon", value=nome_carga_sugerido)
 
         if st.button("📥 Carregar pedidos desse arquivo", type="primary"):
             with st.spinner("Carregando pedidos do arquivo selecionado..."):
-                df_pedidos = carregar_pedidos_empresa(data_ini, data_fim, departamento, nome_arquivo)
+                df_pedidos = carregar_pedidos_empresa(
+                    data_ini,
+                    data_fim,
+                    departamentos_selecionados,
+                    nome_arquivo,
+                )
                 st.session_state["df_pedidos_empresa"] = df_pedidos
                 st.session_state["nome_arquivo_selecionado"] = nome_arquivo
                 st.session_state["nome_carga"] = nome_carga
                 st.session_state["data_ini"] = data_ini
                 st.session_state["data_fim"] = data_fim
                 st.session_state["analista"] = analista
-                st.session_state["departamento"] = departamento
+                st.session_state["departamentos_selecionados"] = departamentos_selecionados
+                st.session_state["departamento"] = departamento_carga
 
     elif buscar:
         st.warning("Nenhum arquivo encontrado para os filtros selecionados.")
@@ -779,16 +892,18 @@ with aba_consulta:
         st.divider()
         st.subheader("3. Pedidos encontrados")
 
-        total_pedidos = len(df_final)
-        total_liberados = int((df_final["STATUS_BANCO"] == "LIBERADO").sum()) if "STATUS_BANCO" in df_final.columns else 0
-        total_nao_liberados = total_pedidos - total_liberados
+        total_linhas = len(df_final)
+        total_pedidos = df_final[COLUNA_PEDIDO].nunique() if COLUNA_PEDIDO in df_final.columns else len(df_final)
+        total_liberados = df_final.loc[df_final["STATUS_BANCO"] == "LIBERADO", COLUNA_PEDIDO].nunique() if "STATUS_BANCO" in df_final.columns else 0
+        total_bloqueados = df_final.loc[df_final["STATUS_BANCO"] == "BLOQUEADO", COLUNA_PEDIDO].nunique() if "STATUS_BANCO" in df_final.columns else 0
         total_valor = df_final[COLUNA_VALOR].fillna(0).sum() if COLUNA_VALOR in df_final.columns else 0
 
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Total de pedidos", total_pedidos)
-        m2.metric("Liberados", total_liberados)
-        m3.metric("Não liberados / pendentes", total_nao_liberados)
-        m4.metric("Valor total", formatar_moeda(total_valor))
+        m1, m2, m3, m4, m5 = st.columns(5)
+        m1.metric("Linhas", total_linhas)
+        m2.metric("Pedidos únicos", total_pedidos)
+        m3.metric("Liberados", int(total_liberados))
+        m4.metric("Bloqueados", int(total_bloqueados))
+        m5.metric("Valor total", formatar_moeda(total_valor))
 
         st.dataframe(df_final, use_container_width=True, hide_index=True)
 
@@ -812,7 +927,7 @@ with aba_consulta:
                         df_final=df_final,
                         nome_carga=st.session_state.get("nome_carga", "Carga sem nome"),
                         nome_arquivo=st.session_state.get("nome_arquivo_selecionado", ""),
-                        usuario_importacao=st.session_state.get("analista", usuario_importacao),
+                        usuario_importacao=usuario_importacao or st.session_state.get("analista", ""),
                         departamento=st.session_state.get("departamento", ""),
                         data_ini=st.session_state.get("data_ini", data_ini),
                         data_fim=st.session_state.get("data_fim", data_fim),
@@ -844,7 +959,7 @@ with aba_historico:
             filtro_pedido = f1.text_input("Filtrar pedido")
             filtro_fornecedor = f2.text_input("Filtrar fornecedor")
             filtro_depto = f3.text_input("Filtrar departamento")
-            filtro_loja = f4.text_input("Filtrar loja")
+            filtro_loja = f4.text_input("Filtrar filial")
 
             df_view = df_hist.copy()
             if filtro_pedido:
@@ -867,19 +982,16 @@ with aba_historico:
 
 
 with aba_config:
-    st.subheader("Como esse app funciona agora")
+    st.subheader("O que foi ajustado")
     st.markdown(
         """
-        Agora o app **não pede upload de planilha**.
-
-        O fluxo é:
-
-        1. Usuário escolhe **data inicial**, **data final** e **analista**.
-        2. O app mostra somente os **departamentos vinculados ao analista escolhido**.
-        3. O app consulta o banco da empresa e lista os **nomes dos arquivos importados**.
-        4. Usuário escolhe o **nome do arquivo**.
-        5. O app busca os pedidos daquele arquivo no banco da empresa.
-        6. O app salva a carga e mantém o histórico dos liberados no Neon/PostgreSQL.
+        - O campo **Departamento** agora é **multiselect**.
+        - Os departamentos do analista já vêm **pré-selecionados**.
+        - O usuário pode marcar/remover qualquer outro departamento.
+        - A query do banco da empresa ficou **chumbada no código**.
+        - O filtro de data usa `C7_EMISSAO` no padrão `YYYYMMDD`.
+        - O nome do arquivo vem de `ZBG_NOMEAR`, retornando como `NOME_ARQUIVO`.
+        - O status vem de `C7_CONAPRO`: `L = LIBERADO` e `B = BLOQUEADO`.
         """
     )
 
@@ -893,55 +1005,6 @@ enabled = true
 user = "SEU_USUARIO_ORACLE"
 password = "SUA_SENHA_ORACLE"
 dsn = "host:1521/service"
-
-# Opcional: se não configurar, o app deixa você digitar o departamento.
-query_departamentos = """
-SELECT DISTINCT
-    DEPARTAMENTO
-FROM SUA_TABELA_DE_IMPORTACAO
-WHERE DATA_IMPORTACAO >= TO_DATE(:data_ini, 'YYYY-MM-DD')
-  AND DATA_IMPORTACAO <  TO_DATE(:data_fim, 'YYYY-MM-DD') + 1
-ORDER BY DEPARTAMENTO
-"""
-
-# Obrigatório: precisa retornar NOME_ARQUIVO.
-query_arquivos = """
-SELECT DISTINCT
-    NOME_ARQUIVO,
-    MAX(DATA_IMPORTACAO) AS DATA_IMPORTACAO,
-    COUNT(DISTINCT PEDIDO) AS QTD_PEDIDOS
-FROM SUA_TABELA_DE_IMPORTACAO
-WHERE DATA_IMPORTACAO >= TO_DATE(:data_ini, 'YYYY-MM-DD')
-  AND DATA_IMPORTACAO <  TO_DATE(:data_fim, 'YYYY-MM-DD') + 1
-  AND (:departamento = 'TODOS' OR DEPARTAMENTO = :departamento)
-GROUP BY NOME_ARQUIVO
-ORDER BY MAX(DATA_IMPORTACAO) DESC
-"""
-
-# Obrigatório: precisa retornar pelo menos PEDIDO.
-# Recomendado retornar também FORNECEDOR, LOJA, VALOR, DEPARTAMENTO, NOME_ARQUIVO, STATUS_BANCO e COD_STATUS_BANCO.
-query_pedidos = """
-SELECT
-    PEDIDO,
-    FORNECEDOR,
-    LOJA,
-    VALOR,
-    DEPARTAMENTO,
-    NOME_ARQUIVO,
-    DATA_IMPORTACAO,
-    CASE
-        WHEN COD_STATUS = 'L' THEN 'LIBERADO'
-        WHEN COD_STATUS = 'B' THEN 'BLOQUEADO'
-        ELSE 'NÃO LIBERADO'
-    END AS STATUS_BANCO,
-    COD_STATUS AS COD_STATUS_BANCO
-FROM SUA_TABELA_DE_IMPORTACAO
-WHERE DATA_IMPORTACAO >= TO_DATE(:data_ini, 'YYYY-MM-DD')
-  AND DATA_IMPORTACAO <  TO_DATE(:data_fim, 'YYYY-MM-DD') + 1
-  AND (:departamento = 'TODOS' OR DEPARTAMENTO = :departamento)
-  AND NOME_ARQUIVO = :nome_arquivo
-ORDER BY PEDIDO
-"""
 ''',
         language="toml",
     )
@@ -959,5 +1022,5 @@ oracledb
     )
 
     st.warning(
-        "Importante: se o banco da empresa for interno/VPN, o Streamlit Cloud só vai conseguir acessar se a empresa liberar acesso externo. Caso contrário, esse app precisa rodar dentro da rede da empresa ou atrás de uma API interna."
+        "Se o banco da empresa for interno/VPN, o Streamlit Cloud só vai conectar se a empresa liberar acesso externo. Caso contrário, rode o app dentro da rede da empresa ou atrás de uma API interna."
     )
