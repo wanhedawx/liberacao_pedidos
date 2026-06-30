@@ -1,5 +1,6 @@
 import json
-from datetime import datetime
+import re
+from datetime import date, datetime, timedelta
 from io import BytesIO
 
 import pandas as pd
@@ -15,32 +16,25 @@ from sqlalchemy.exc import SQLAlchemyError
 st.set_page_config(
     page_title="Liberação de Pedidos",
     page_icon="📦",
-    layout="wide"
+    layout="wide",
 )
 
 
 # =========================================================
-# CONFIGURAÇÃO PADRÃO DA SUA PLANILHA
-# Ajuste aqui se o nome da coluna na sua planilha for diferente.
+# NOMES PADRÃO ESPERADOS NO RETORNO DA QUERY DA EMPRESA
+# A query da empresa precisa retornar pelo menos: PEDIDO
+# Recomendo retornar também: FORNECEDOR, LOJA, VALOR, DEPARTAMENTO,
+# NOME_ARQUIVO, DATA_IMPORTACAO, STATUS_BANCO, COD_STATUS_BANCO
 # =========================================================
 
 COLUNA_PEDIDO = "PEDIDO"
 COLUNA_FORNECEDOR = "FORNECEDOR"
 COLUNA_LOJA = "LOJA"
 COLUNA_VALOR = "VALOR"
-COLUNA_STATUS_PLANILHA = "STATUS"
+COLUNA_DEPARTAMENTO = "DEPARTAMENTO"
+COLUNA_NOME_ARQUIVO = "NOME_ARQUIVO"
+COLUNA_DATA_IMPORTACAO = "DATA_IMPORTACAO"
 
-# Colunas mínimas que a planilha precisa ter para o sistema funcionar.
-COLUNAS_OBRIGATORIAS = [
-    COLUNA_PEDIDO,
-]
-
-# Colunas que serão removidas automaticamente quando existirem na planilha.
-# Exemplo: ["OBS", "USUARIO", "DATA_EXPORTACAO"]
-COLUNAS_REMOVER_PADRAO = []
-
-# Valores que serão considerados como liberados.
-# Aqui deixei alguns exemplos comuns.
 VALORES_STATUS_LIBERADO = {
     "L",
     "LIBERADO",
@@ -53,15 +47,42 @@ VALORES_STATUS_LIBERADO = {
 
 
 # =========================================================
+# ANALISTAS E DEPARTAMENTOS FIXOS
+# =========================================================
+
+ANALISTAS = {
+    "Cleviton": [
+        "Portas e Janelas", "Ferramentas", "Ferragens", "Automotivos"
+    ],
+    "Alec": [
+        "Eletrica", "Iluminacao", "Hidraulica"
+    ],
+    "Jonatas": [
+        "Moveis e Colchoes", "Decoracao", "Cama Mesa e Banho", "Lazer",
+        "Casa e UD", "Jardim",
+    ],
+    "Beatriz": [
+        "Eletro", "Tecnologia", "Climatizacao"
+    ],
+    "Ruan": [
+        "Tintas", "Organizacao da Casa"
+    ],
+    "Jessica": [
+        "Materiais de Construcao", "Banho e Cozinha"
+    ],
+    "Rose": [
+        "Pisos e Revestimento"
+    ],
+}
+
+# =========================================================
 # CSS VISUAL
 # =========================================================
 
 st.markdown(
     """
     <style>
-        .block-container {
-            padding-top: 1.5rem;
-        }
+        .block-container { padding-top: 1.5rem; }
         .titulo-principal {
             font-size: 34px;
             font-weight: 800;
@@ -85,12 +106,101 @@ st.markdown(
 
 
 # =========================================================
-# FUNÇÕES DE CONEXÃO COM O NEON / POSTGRESQL
+# FUNÇÕES GERAIS
+# =========================================================
+
+
+def limpar_texto(valor):
+    if pd.isna(valor):
+        return ""
+    return str(valor).strip()
+
+
+
+def limpar_valor(valor):
+    if pd.isna(valor) or valor == "":
+        return None
+
+    if isinstance(valor, (int, float)):
+        return float(valor)
+
+    valor_txt = str(valor).strip()
+    valor_txt = valor_txt.replace("R$", "").replace(" ", "")
+
+    # Trata padrão brasileiro: 1.234,56
+    if "," in valor_txt:
+        valor_txt = valor_txt.replace(".", "").replace(",", ".")
+
+    try:
+        return float(valor_txt)
+    except Exception:
+        return None
+
+
+
+def normalizar_status(valor):
+    status = limpar_texto(valor).upper()
+
+    if not status:
+        return "NÃO INFORMADO"
+
+    if status in VALORES_STATUS_LIBERADO:
+        return "LIBERADO"
+
+    if status in {"B", "BLOQUEADO", "BLOQUEADA"}:
+        return "BLOQUEADO"
+
+    return "NÃO LIBERADO"
+
+
+
+def gerar_excel(df):
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name="Pedidos")
+    output.seek(0)
+    return output
+
+
+
+def row_json(row):
+    dados = {}
+    for k, v in row.items():
+        if pd.isna(v):
+            dados[k] = None
+        elif isinstance(v, (pd.Timestamp, datetime, date)):
+            dados[k] = str(v)
+        else:
+            dados[k] = v
+    return json.dumps(dados, ensure_ascii=False, default=str)
+
+
+
+def formatar_moeda(valor):
+    try:
+        return f"R$ {float(valor):,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+    except Exception:
+        return "R$ 0,00"
+
+
+
+def detectar_binds(sql):
+    # Captura binds Oracle no formato :data_ini, :data_fim, :departamento, :nome_arquivo
+    return set(re.findall(r":([A-Za-z_][A-Za-z0-9_]*)", sql or ""))
+
+
+
+def filtrar_params_sql(sql, params):
+    binds = detectar_binds(sql)
+    return {k: v for k, v in params.items() if k in binds}
+
+
+# =========================================================
+# CONEXÃO COM NEON / POSTGRESQL DO APP
 # =========================================================
 
 
 def get_postgres_url():
-    """Lê a URL do PostgreSQL no .streamlit/secrets.toml."""
     try:
         return st.secrets["connections"]["postgresql"]["url"]
     except Exception:
@@ -103,18 +213,18 @@ def get_postgres_url():
 
 
 @st.cache_resource(show_spinner=False)
-def get_engine():
+def get_engine_neon():
     url = get_postgres_url()
     if not url:
         return None
-
     return create_engine(url, pool_pre_ping=True)
 
 
-def testar_conexao_postgres():
-    engine = get_engine()
+
+def testar_conexao_neon():
+    engine = get_engine_neon()
     if engine is None:
-        return False, "String do Neon não encontrada no secrets.toml."
+        return False, "String do Neon não encontrada nos Secrets."
 
     try:
         with engine.begin() as conn:
@@ -124,8 +234,9 @@ def testar_conexao_postgres():
         return False, str(e)
 
 
-def criar_tabelas_se_nao_existirem():
-    engine = get_engine()
+
+def criar_tabelas_neon():
+    engine = get_engine_neon()
     if engine is None:
         return False
 
@@ -169,6 +280,24 @@ def criar_tabelas_se_nao_existirem():
         dados_ultima_planilha JSONB,
         UNIQUE (pedido, loja)
     );
+
+    ALTER TABLE cargas_importacao
+    ADD COLUMN IF NOT EXISTS departamento TEXT;
+
+    ALTER TABLE cargas_importacao
+    ADD COLUMN IF NOT EXISTS filtro_data_ini DATE;
+
+    ALTER TABLE cargas_importacao
+    ADD COLUMN IF NOT EXISTS filtro_data_fim DATE;
+
+    ALTER TABLE pedidos_importados
+    ADD COLUMN IF NOT EXISTS departamento TEXT;
+
+    ALTER TABLE pedidos_importados
+    ADD COLUMN IF NOT EXISTS nome_arquivo_origem TEXT;
+
+    ALTER TABLE pedidos_liberados_historico
+    ADD COLUMN IF NOT EXISTS departamento TEXT;
     """
 
     try:
@@ -182,95 +311,142 @@ def criar_tabelas_se_nao_existirem():
 
 
 # =========================================================
-# FUNÇÕES DE ARQUIVO / TRATAMENTO
+# CONEXÃO COM BANCO DA EMPRESA / ORACLE
 # =========================================================
 
 
-def ler_arquivo(arquivo):
-    nome = arquivo.name.lower()
-
-    if nome.endswith(".xlsx") or nome.endswith(".xls"):
-        return pd.read_excel(arquivo)
-
-    if nome.endswith(".csv"):
-        return pd.read_csv(arquivo, sep=None, engine="python")
-
-    raise ValueError("Formato não suportado. Use .xlsx, .xls ou .csv")
-
-
-def limpar_texto(valor):
-    if pd.isna(valor):
-        return ""
-    return str(valor).strip()
-
-
-def limpar_valor(valor):
-    if pd.isna(valor) or valor == "":
-        return None
-
-    if isinstance(valor, (int, float)):
-        return float(valor)
-
-    valor_txt = str(valor).strip()
-    valor_txt = valor_txt.replace("R$", "").replace(" ", "")
-
-    # Trata padrão brasileiro: 1.234,56
-    if "," in valor_txt:
-        valor_txt = valor_txt.replace(".", "").replace(",", ".")
-
+def get_empresa_cfg():
     try:
-        return float(valor_txt)
+        return st.secrets["empresa_oracle"]
     except Exception:
         return None
 
 
-def normalizar_status(valor):
-    status = limpar_texto(valor).upper()
 
-    if not status:
-        return "NÃO INFORMADO"
+def empresa_habilitada():
+    cfg = get_empresa_cfg()
+    if cfg is None:
+        return False, "Configuração [empresa_oracle] não encontrada nos Secrets."
 
-    if status in VALORES_STATUS_LIBERADO:
-        return "LIBERADO"
+    if not bool(cfg.get("enabled", False)):
+        return False, "Banco da empresa está com enabled = false nos Secrets."
 
-    if status in {"B", "BLOQUEADO", "BLOQUEADA"}:
-        return "BLOQUEADO"
+    campos = ["user", "password", "dsn", "query_arquivos", "query_pedidos"]
+    faltando = [c for c in campos if not cfg.get(c)]
+    if faltando:
+        return False, f"Configuração incompleta em [empresa_oracle]. Faltando: {', '.join(faltando)}"
 
-    return "NÃO LIBERADO"
-
-
-def gerar_excel(df):
-    output = BytesIO()
-    with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        df.to_excel(writer, index=False, sheet_name="Pedidos")
-    output.seek(0)
-    return output
+    return True, "Configuração OK"
 
 
-def row_json(row):
-    dados = {}
-    for k, v in row.items():
-        if pd.isna(v):
-            dados[k] = None
-        elif isinstance(v, (pd.Timestamp, datetime)):
-            dados[k] = str(v)
-        else:
-            dados[k] = v
-    return json.dumps(dados, ensure_ascii=False, default=str)
+@st.cache_resource(show_spinner=False)
+def get_oracle_connection(user, password, dsn):
+    import oracledb
+    return oracledb.connect(user=user, password=password, dsn=dsn)
 
 
-def tratar_planilha(df_original, colunas_remover_extra=None):
-    colunas_remover_extra = colunas_remover_extra or []
 
-    df = df_original.copy()
-    df.columns = [str(c).strip() for c in df.columns]
+def testar_conexao_empresa():
+    ok, msg = empresa_habilitada()
+    if not ok:
+        return False, msg
 
-    colunas_faltando = [c for c in COLUNAS_OBRIGATORIAS if c not in df.columns]
-    if colunas_faltando:
-        return None, colunas_faltando
+    try:
+        import oracledb  # noqa: F401
+    except ImportError:
+        return False, "Biblioteca oracledb não instalada. Confira o requirements.txt."
 
-    colunas_remover = list(set(COLUNAS_REMOVER_PADRAO + colunas_remover_extra))
-    df = df.drop(columns=colunas_remover, errors="ignore")
+    cfg = get_empresa_cfg()
+
+    try:
+        conn = get_oracle_connection(cfg.get("user"), cfg.get("password"), cfg.get("dsn"))
+        cursor = conn.cursor()
+        cursor.execute("SELECT 1 FROM DUAL")
+        cursor.fetchone()
+        cursor.close()
+        return True, "Conexão OK"
+    except Exception as e:
+        return False, str(e)
+
+
+
+def executar_query_empresa(sql, params):
+    cfg = get_empresa_cfg()
+    if cfg is None:
+        st.error("Configuração [empresa_oracle] não encontrada nos Secrets.")
+        return pd.DataFrame()
+
+    try:
+        conn = get_oracle_connection(cfg.get("user"), cfg.get("password"), cfg.get("dsn"))
+        params_usados = filtrar_params_sql(sql, params)
+        df = pd.read_sql(sql, conn, params=params_usados)
+        df.columns = [str(c).strip().upper() for c in df.columns]
+        return df
+    except Exception as e:
+        st.error("Erro ao executar consulta no banco da empresa.")
+        st.code(str(e))
+        return pd.DataFrame()
+
+
+
+def carregar_departamentos(data_ini, data_fim):
+    cfg = get_empresa_cfg()
+    if cfg is None or not cfg.get("query_departamentos"):
+        return []
+
+    params = {
+        "data_ini": data_ini.strftime("%Y-%m-%d"),
+        "data_fim": data_fim.strftime("%Y-%m-%d"),
+    }
+    df = executar_query_empresa(cfg.get("query_departamentos"), params)
+
+    if df.empty:
+        return []
+
+    col = "DEPARTAMENTO" if "DEPARTAMENTO" in df.columns else df.columns[0]
+    valores = sorted([limpar_texto(v) for v in df[col].dropna().unique().tolist() if limpar_texto(v)])
+    return valores
+
+
+
+def carregar_arquivos_empresa(data_ini, data_fim, departamento):
+    cfg = get_empresa_cfg()
+    params = {
+        "data_ini": data_ini.strftime("%Y-%m-%d"),
+        "data_fim": data_fim.strftime("%Y-%m-%d"),
+        "departamento": departamento,
+    }
+    df = executar_query_empresa(cfg.get("query_arquivos"), params)
+
+    if df.empty:
+        return df
+
+    if COLUNA_NOME_ARQUIVO not in df.columns:
+        st.error("A query_arquivos precisa retornar a coluna NOME_ARQUIVO.")
+        return pd.DataFrame()
+
+    df[COLUNA_NOME_ARQUIVO] = df[COLUNA_NOME_ARQUIVO].apply(limpar_texto)
+    df = df[df[COLUNA_NOME_ARQUIVO] != ""].drop_duplicates().copy()
+    return df
+
+
+
+def carregar_pedidos_empresa(data_ini, data_fim, departamento, nome_arquivo):
+    cfg = get_empresa_cfg()
+    params = {
+        "data_ini": data_ini.strftime("%Y-%m-%d"),
+        "data_fim": data_fim.strftime("%Y-%m-%d"),
+        "departamento": departamento,
+        "nome_arquivo": nome_arquivo,
+    }
+    df = executar_query_empresa(cfg.get("query_pedidos"), params)
+
+    if df.empty:
+        return df
+
+    if COLUNA_PEDIDO not in df.columns:
+        st.error("A query_pedidos precisa retornar a coluna PEDIDO.")
+        return pd.DataFrame()
 
     df[COLUNA_PEDIDO] = df[COLUNA_PEDIDO].apply(limpar_texto)
     df = df[df[COLUNA_PEDIDO] != ""].copy()
@@ -284,156 +460,30 @@ def tratar_planilha(df_original, colunas_remover_extra=None):
     if COLUNA_VALOR not in df.columns:
         df[COLUNA_VALOR] = None
 
+    if COLUNA_DEPARTAMENTO not in df.columns:
+        df[COLUNA_DEPARTAMENTO] = departamento
+
+    if COLUNA_NOME_ARQUIVO not in df.columns:
+        df[COLUNA_NOME_ARQUIVO] = nome_arquivo
+
+    if "STATUS_BANCO" not in df.columns:
+        if "COD_STATUS_BANCO" in df.columns:
+            df["STATUS_BANCO"] = df["COD_STATUS_BANCO"].apply(normalizar_status)
+        else:
+            df["STATUS_BANCO"] = "PENDENTE CONSULTA"
+
+    if "COD_STATUS_BANCO" not in df.columns:
+        df["COD_STATUS_BANCO"] = df["STATUS_BANCO"]
+
     df[COLUNA_FORNECEDOR] = df[COLUNA_FORNECEDOR].apply(limpar_texto)
-    df[COLUNA_LOJA] = df[COLUNA_LOJA].apply(limpar_texto)
-    df[COLUNA_LOJA] = df[COLUNA_LOJA].replace("", "GERAL")
+    df[COLUNA_LOJA] = df[COLUNA_LOJA].apply(limpar_texto).replace("", "GERAL")
     df[COLUNA_VALOR] = df[COLUNA_VALOR].apply(limpar_valor)
+    df[COLUNA_DEPARTAMENTO] = df[COLUNA_DEPARTAMENTO].apply(limpar_texto)
+    df[COLUNA_NOME_ARQUIVO] = df[COLUNA_NOME_ARQUIVO].apply(limpar_texto)
+    df["STATUS_BANCO"] = df["STATUS_BANCO"].apply(normalizar_status)
+    df["COD_STATUS_BANCO"] = df["COD_STATUS_BANCO"].apply(limpar_texto)
 
-    return df, []
-
-
-# =========================================================
-# CONSULTA AO BANCO DA EMPRESA
-# =========================================================
-
-
-def consultar_status_pela_coluna_da_planilha(df):
-    df_status = df[[COLUNA_PEDIDO]].drop_duplicates().copy()
-
-    if COLUNA_STATUS_PLANILHA in df.columns:
-        temp = df[[COLUNA_PEDIDO, COLUNA_STATUS_PLANILHA]].drop_duplicates().copy()
-        temp["STATUS_BANCO"] = temp[COLUNA_STATUS_PLANILHA].apply(normalizar_status)
-        temp["COD_STATUS_BANCO"] = temp[COLUNA_STATUS_PLANILHA].apply(limpar_texto)
-        return temp[[COLUNA_PEDIDO, "STATUS_BANCO", "COD_STATUS_BANCO"]]
-
-    df_status["STATUS_BANCO"] = "PENDENTE CONSULTA"
-    df_status["COD_STATUS_BANCO"] = ""
-    return df_status
-
-
-def consultar_status_por_arquivo_status(arquivo_status):
-    df_status = ler_arquivo(arquivo_status)
-    df_status.columns = [str(c).strip() for c in df_status.columns]
-
-    if COLUNA_PEDIDO not in df_status.columns:
-        st.error(f"O arquivo de status precisa ter a coluna {COLUNA_PEDIDO}.")
-        return pd.DataFrame()
-
-    if "STATUS_BANCO" not in df_status.columns:
-        st.error("O arquivo de status precisa ter a coluna STATUS_BANCO.")
-        return pd.DataFrame()
-
-    df_status[COLUNA_PEDIDO] = df_status[COLUNA_PEDIDO].apply(limpar_texto)
-    df_status["STATUS_BANCO"] = df_status["STATUS_BANCO"].apply(normalizar_status)
-
-    if "COD_STATUS_BANCO" not in df_status.columns:
-        df_status["COD_STATUS_BANCO"] = df_status["STATUS_BANCO"]
-
-    return df_status[[COLUNA_PEDIDO, "STATUS_BANCO", "COD_STATUS_BANCO"]].drop_duplicates()
-
-
-def consultar_status_oracle_empresa(pedidos):
-    """
-    Consulta o banco da empresa.
-
-    Para usar, configure no .streamlit/secrets.toml:
-
-    [empresa_oracle]
-    enabled = true
-    user = "SEU_USUARIO"
-    password = "SUA_SENHA"
-    dsn = "host:1521/service"
-    query_status = '''
-        SELECT
-            C7_NUM AS PEDIDO,
-            CASE
-                WHEN C7_CONAPRO = 'L' THEN 'LIBERADO'
-                WHEN C7_CONAPRO = 'B' THEN 'BLOQUEADO'
-                ELSE 'NÃO LIBERADO'
-            END AS STATUS_BANCO,
-            C7_CONAPRO AS COD_STATUS_BANCO
-        FROM TOTVS.SC7010
-        WHERE D_E_L_E_T_ = ' '
-          AND C7_NUM IN ({placeholders})
-    '''
-    """
-
-    try:
-        cfg = st.secrets["empresa_oracle"]
-        enabled = bool(cfg.get("enabled", False))
-    except Exception:
-        enabled = False
-        cfg = None
-
-    if not enabled:
-        st.warning("Consulta ao banco da empresa ainda não configurada no secrets.toml.")
-        return pd.DataFrame()
-
-    try:
-        import oracledb
-    except ImportError:
-        st.error("Biblioteca oracledb não instalada. Adicione oracledb no requirements.txt.")
-        return pd.DataFrame()
-
-    query_modelo = cfg.get("query_status", "")
-    if "{placeholders}" not in query_modelo:
-        st.error("A query_status precisa conter {placeholders} no IN dos pedidos.")
-        return pd.DataFrame()
-
-    usuario = cfg.get("user")
-    senha = cfg.get("password")
-    dsn = cfg.get("dsn")
-
-    if not usuario or not senha or not dsn:
-        st.error("Configuração empresa_oracle incompleta no secrets.toml.")
-        return pd.DataFrame()
-
-    pedidos = [limpar_texto(p) for p in pedidos if limpar_texto(p)]
-    resultados = []
-    tamanho_lote = 900
-
-    try:
-        conn = oracledb.connect(user=usuario, password=senha, dsn=dsn)
-
-        for i in range(0, len(pedidos), tamanho_lote):
-            lote = pedidos[i:i + tamanho_lote]
-            binds = {}
-            placeholders = []
-
-            for idx, pedido in enumerate(lote):
-                chave = f"p{idx}"
-                placeholders.append(f":{chave}")
-                binds[chave] = pedido
-
-            sql = query_modelo.replace("{placeholders}", ", ".join(placeholders))
-            df_lote = pd.read_sql(sql, conn, params=binds)
-            resultados.append(df_lote)
-
-        conn.close()
-
-    except Exception as e:
-        st.error("Erro ao consultar o banco da empresa.")
-        st.code(str(e))
-        return pd.DataFrame()
-
-    if not resultados:
-        return pd.DataFrame()
-
-    df_status = pd.concat(resultados, ignore_index=True)
-    df_status.columns = [str(c).strip().upper() for c in df_status.columns]
-
-    if "PEDIDO" not in df_status.columns or "STATUS_BANCO" not in df_status.columns:
-        st.error("A consulta precisa retornar as colunas PEDIDO e STATUS_BANCO.")
-        return pd.DataFrame()
-
-    if "COD_STATUS_BANCO" not in df_status.columns:
-        df_status["COD_STATUS_BANCO"] = df_status["STATUS_BANCO"]
-
-    df_status["PEDIDO"] = df_status["PEDIDO"].apply(limpar_texto)
-    df_status["STATUS_BANCO"] = df_status["STATUS_BANCO"].apply(normalizar_status)
-    df_status["COD_STATUS_BANCO"] = df_status["COD_STATUS_BANCO"].apply(limpar_texto)
-
-    return df_status[["PEDIDO", "STATUS_BANCO", "COD_STATUS_BANCO"]].drop_duplicates()
+    return df
 
 
 # =========================================================
@@ -441,10 +491,10 @@ def consultar_status_oracle_empresa(pedidos):
 # =========================================================
 
 
-def salvar_carga_no_neon(df_final, nome_carga, nome_arquivo, usuario_importacao):
-    engine = get_engine()
+def salvar_carga_no_neon(df_final, nome_carga, nome_arquivo, usuario_importacao, departamento, data_ini, data_fim):
+    engine = get_engine_neon()
     if engine is None:
-        st.error("Neon/PostgreSQL não configurado. Verifique o secrets.toml.")
+        st.error("Neon/PostgreSQL não configurado. Verifique os Secrets.")
         return False
 
     qtd_pedidos = len(df_final)
@@ -457,8 +507,11 @@ def salvar_carga_no_neon(df_final, nome_carga, nome_arquivo, usuario_importacao)
                 text(
                     """
                     INSERT INTO cargas_importacao
-                    (nome_carga, nome_arquivo, usuario_importacao, qtd_pedidos, qtd_liberados, qtd_nao_liberados)
-                    VALUES (:nome_carga, :nome_arquivo, :usuario_importacao, :qtd_pedidos, :qtd_liberados, :qtd_nao_liberados)
+                    (nome_carga, nome_arquivo, usuario_importacao, qtd_pedidos, qtd_liberados, qtd_nao_liberados,
+                     departamento, filtro_data_ini, filtro_data_fim)
+                    VALUES
+                    (:nome_carga, :nome_arquivo, :usuario_importacao, :qtd_pedidos, :qtd_liberados, :qtd_nao_liberados,
+                     :departamento, :filtro_data_ini, :filtro_data_fim)
                     RETURNING id
                     """
                 ),
@@ -469,6 +522,9 @@ def salvar_carga_no_neon(df_final, nome_carga, nome_arquivo, usuario_importacao)
                     "qtd_pedidos": qtd_pedidos,
                     "qtd_liberados": qtd_liberados,
                     "qtd_nao_liberados": qtd_nao_liberados,
+                    "departamento": departamento,
+                    "filtro_data_ini": data_ini,
+                    "filtro_data_fim": data_fim,
                 },
             ).scalar_one()
 
@@ -477,6 +533,8 @@ def salvar_carga_no_neon(df_final, nome_carga, nome_arquivo, usuario_importacao)
                 fornecedor = limpar_texto(row.get(COLUNA_FORNECEDOR))
                 loja = limpar_texto(row.get(COLUNA_LOJA)) or "GERAL"
                 valor = limpar_valor(row.get(COLUNA_VALOR))
+                depto_row = limpar_texto(row.get(COLUNA_DEPARTAMENTO)) or departamento
+                nome_arq_row = limpar_texto(row.get(COLUNA_NOME_ARQUIVO)) or nome_arquivo
                 status_banco = limpar_texto(row.get("STATUS_BANCO"))
                 cod_status_banco = limpar_texto(row.get("COD_STATUS_BANCO"))
                 dados = row_json(row)
@@ -485,9 +543,11 @@ def salvar_carga_no_neon(df_final, nome_carga, nome_arquivo, usuario_importacao)
                     text(
                         """
                         INSERT INTO pedidos_importados
-                        (carga_id, pedido, fornecedor, loja, valor, status_banco, cod_status_banco, dados_planilha)
+                        (carga_id, pedido, fornecedor, loja, valor, status_banco, cod_status_banco,
+                         dados_planilha, departamento, nome_arquivo_origem)
                         VALUES
-                        (:carga_id, :pedido, :fornecedor, :loja, :valor, :status_banco, :cod_status_banco, CAST(:dados_planilha AS JSONB))
+                        (:carga_id, :pedido, :fornecedor, :loja, :valor, :status_banco, :cod_status_banco,
+                         CAST(:dados_planilha AS JSONB), :departamento, :nome_arquivo_origem)
                         """
                     ),
                     {
@@ -499,6 +559,8 @@ def salvar_carga_no_neon(df_final, nome_carga, nome_arquivo, usuario_importacao)
                         "status_banco": status_banco,
                         "cod_status_banco": cod_status_banco,
                         "dados_planilha": dados,
+                        "departamento": depto_row,
+                        "nome_arquivo_origem": nome_arq_row,
                     },
                 )
 
@@ -507,9 +569,11 @@ def salvar_carga_no_neon(df_final, nome_carga, nome_arquivo, usuario_importacao)
                         text(
                             """
                             INSERT INTO pedidos_liberados_historico
-                            (pedido, fornecedor, loja, valor, status_banco, cod_status_banco, primeira_carga, ultima_carga, dados_ultima_planilha)
+                            (pedido, fornecedor, loja, valor, status_banco, cod_status_banco,
+                             primeira_carga, ultima_carga, dados_ultima_planilha, departamento)
                             VALUES
-                            (:pedido, :fornecedor, :loja, :valor, :status_banco, :cod_status_banco, :nome_carga, :nome_carga, CAST(:dados_planilha AS JSONB))
+                            (:pedido, :fornecedor, :loja, :valor, :status_banco, :cod_status_banco,
+                             :nome_carga, :nome_carga, CAST(:dados_planilha AS JSONB), :departamento)
                             ON CONFLICT (pedido, loja)
                             DO UPDATE SET
                                 fornecedor = EXCLUDED.fornecedor,
@@ -518,7 +582,8 @@ def salvar_carga_no_neon(df_final, nome_carga, nome_arquivo, usuario_importacao)
                                 cod_status_banco = EXCLUDED.cod_status_banco,
                                 ultima_carga = EXCLUDED.ultima_carga,
                                 ultima_atualizacao = NOW(),
-                                dados_ultima_planilha = EXCLUDED.dados_ultima_planilha
+                                dados_ultima_planilha = EXCLUDED.dados_ultima_planilha,
+                                departamento = EXCLUDED.departamento
                             """
                         ),
                         {
@@ -530,6 +595,7 @@ def salvar_carga_no_neon(df_final, nome_carga, nome_arquivo, usuario_importacao)
                             "cod_status_banco": cod_status_banco,
                             "nome_carga": nome_carga,
                             "dados_planilha": dados,
+                            "departamento": depto_row,
                         },
                     )
 
@@ -542,12 +608,12 @@ def salvar_carga_no_neon(df_final, nome_carga, nome_arquivo, usuario_importacao)
 
 
 # =========================================================
-# CONSULTAS HISTÓRICO
+# CONSULTAS HISTÓRICO NEON
 # =========================================================
 
 
-def carregar_cargas():
-    engine = get_engine()
+def carregar_cargas_neon():
+    engine = get_engine_neon()
     if engine is None:
         return pd.DataFrame()
 
@@ -560,6 +626,9 @@ def carregar_cargas():
                     nome_carga,
                     nome_arquivo,
                     usuario_importacao,
+                    departamento,
+                    filtro_data_ini,
+                    filtro_data_fim,
                     data_importacao,
                     qtd_pedidos,
                     qtd_liberados,
@@ -573,8 +642,9 @@ def carregar_cargas():
         return pd.DataFrame()
 
 
-def carregar_historico_liberados():
-    engine = get_engine()
+
+def carregar_historico_liberados_neon():
+    engine = get_engine_neon()
     if engine is None:
         return pd.DataFrame()
 
@@ -586,6 +656,7 @@ def carregar_historico_liberados():
                     pedido,
                     fornecedor,
                     loja,
+                    departamento,
                     valor,
                     status_banco,
                     cod_status_banco,
@@ -608,226 +679,184 @@ def carregar_historico_liberados():
 
 st.markdown('<div class="titulo-principal">📦 Liberação de Pedidos</div>', unsafe_allow_html=True)
 st.markdown(
-    '<div class="subtitulo">Importe a planilha padrão, consulte o status e mantenha o histórico dos pedidos liberados no Neon/PostgreSQL.</div>',
+    '<div class="subtitulo">Leia os pedidos direto do banco da empresa por data, departamento e nome do arquivo importado. Depois salve o histórico no Neon/PostgreSQL.</div>',
     unsafe_allow_html=True,
 )
 
-ok_conexao, msg_conexao = testar_conexao_postgres()
+ok_neon, msg_neon = testar_conexao_neon()
+ok_empresa, msg_empresa = testar_conexao_empresa()
 
 with st.sidebar:
-    st.header("Configuração")
+    st.header("Conexões")
 
-    if ok_conexao:
+    if ok_neon:
         st.success("Neon conectado")
-        criar_tabelas_se_nao_existirem()
+        criar_tabelas_neon()
     else:
         st.error("Neon não conectado")
-        st.caption(msg_conexao)
+        st.caption(msg_neon)
 
+    if ok_empresa:
+        st.success("Banco da empresa conectado")
+    else:
+        st.error("Banco da empresa não conectado")
+        st.caption(msg_empresa)
+
+    st.divider()
     usuario_importacao = st.text_input("Usuário", value="Vitoria")
 
-    metodo_status = st.selectbox(
-        "Como buscar o status?",
-        options=[
-            "Status pela coluna da planilha",
-            "Arquivo complementar de status",
-            "Banco da empresa / Oracle",
-        ],
-        index=0,
-    )
-
-    modo_avancado = st.checkbox("Modo avançado: remover colunas manualmente", value=False)
-
-aba_importar, aba_historico, aba_config = st.tabs([
-    "📥 Importar pedidos",
-    "📚 Histórico",
-    "⚙️ Configuração esperada",
+aba_consulta, aba_historico, aba_config = st.tabs([
+    "🔎 Consultar banco da empresa",
+    "📚 Histórico Neon",
+    "⚙️ Configuração",
 ])
 
 
-with aba_importar:
-    c1, c2 = st.columns([2, 1])
+with aba_consulta:
+    st.subheader("1. Filtros para buscar os arquivos importados")
 
-    with c1:
-        nome_carga = st.text_input(
-            "Nome da carga",
-            placeholder="Exemplo: Pedidos liberados - Julho",
-        )
+    hoje = date.today()
+    col_data1, col_data2, col_analista, col_depto = st.columns([1, 1, 1.1, 1.6])
 
-    with c2:
-        st.write("")
-        st.write("")
-        st.caption("Esse nome será salvo no histórico do Neon.")
+    with col_data1:
+        data_ini = st.date_input("Data inicial", value=hoje - timedelta(days=30), format="DD/MM/YYYY")
 
-    arquivo = st.file_uploader(
-        "Selecione a planilha padrão",
-        type=["xlsx", "xls", "csv"],
-    )
+    with col_data2:
+        data_fim = st.date_input("Data final", value=hoje, format="DD/MM/YYYY")
 
-    arquivo_status = None
-    if metodo_status == "Arquivo complementar de status":
-        arquivo_status = st.file_uploader(
-            "Selecione o arquivo complementar de status",
-            type=["xlsx", "xls", "csv"],
-            key="arquivo_status",
-        )
+    with col_analista:
+        analista = st.selectbox("Analista", options=list(ANALISTAS.keys()))
 
-    if arquivo is not None:
-        try:
-            df_original = ler_arquivo(arquivo)
-            df_original.columns = [str(c).strip() for c in df_original.columns]
+    with col_depto:
+        departamentos_analista = ANALISTAS.get(analista, [])
+        departamento = st.selectbox("Departamento", options=departamentos_analista)
 
-            st.subheader("Colunas encontradas")
-            st.dataframe(pd.DataFrame({"colunas": list(df_original.columns)}), use_container_width=True, hide_index=True)
+    if data_ini > data_fim:
+        st.error("A data inicial não pode ser maior que a data final.")
+        st.stop()
 
-            colunas_remover_extra = []
-            if modo_avancado:
-                colunas_remover_extra = st.multiselect(
-                    "Colunas adicionais para remover nesta carga",
-                    options=list(df_original.columns),
-                    default=[],
-                )
+    buscar = st.button("🔎 Buscar arquivos importados", type="primary", disabled=not ok_empresa)
 
-            df_tratado, colunas_faltando = tratar_planilha(df_original, colunas_remover_extra)
+    if buscar:
+        with st.spinner("Buscando arquivos importados no banco da empresa..."):
+            st.session_state["df_arquivos_empresa"] = carregar_arquivos_empresa(data_ini, data_fim, departamento)
+            st.session_state["filtros_arquivos"] = {
+                "data_ini": data_ini,
+                "data_fim": data_fim,
+                "analista": analista,
+                "departamento": departamento,
+            }
 
-            if colunas_faltando:
-                st.error("A planilha não está no padrão esperado.")
-                st.write("Colunas faltando:")
-                st.code("\n".join(colunas_faltando))
-                st.stop()
+    df_arquivos = st.session_state.get("df_arquivos_empresa", pd.DataFrame())
 
-            # Busca status
-            df_status = pd.DataFrame()
+    if not df_arquivos.empty:
+        st.subheader("2. Escolha o arquivo importado")
+        st.dataframe(df_arquivos, use_container_width=True, hide_index=True)
 
-            if metodo_status == "Status pela coluna da planilha":
-                df_status = consultar_status_pela_coluna_da_planilha(df_tratado)
+        arquivos = df_arquivos[COLUNA_NOME_ARQUIVO].dropna().astype(str).drop_duplicates().tolist()
+        nome_arquivo = st.selectbox("Nome do arquivo importado", options=arquivos)
 
-            elif metodo_status == "Arquivo complementar de status":
-                if arquivo_status is None:
-                    st.warning("Envie o arquivo complementar de status para continuar.")
-                    st.stop()
-                df_status = consultar_status_por_arquivo_status(arquivo_status)
+        nome_carga_sugerido = f"{analista} - {departamento} - {nome_arquivo} - {data_ini.strftime('%d/%m/%Y')} a {data_fim.strftime('%d/%m/%Y')}"
+        nome_carga = st.text_input("Nome para salvar no histórico do Neon", value=nome_carga_sugerido)
 
-            elif metodo_status == "Banco da empresa / Oracle":
-                pedidos = df_tratado[COLUNA_PEDIDO].dropna().astype(str).unique().tolist()
-                with st.spinner("Consultando banco da empresa..."):
-                    df_status = consultar_status_oracle_empresa(pedidos)
+        if st.button("📥 Carregar pedidos desse arquivo", type="primary"):
+            with st.spinner("Carregando pedidos do arquivo selecionado..."):
+                df_pedidos = carregar_pedidos_empresa(data_ini, data_fim, departamento, nome_arquivo)
+                st.session_state["df_pedidos_empresa"] = df_pedidos
+                st.session_state["nome_arquivo_selecionado"] = nome_arquivo
+                st.session_state["nome_carga"] = nome_carga
+                st.session_state["data_ini"] = data_ini
+                st.session_state["data_fim"] = data_fim
+                st.session_state["analista"] = analista
+                st.session_state["departamento"] = departamento
 
-            if df_status.empty:
-                st.warning("Nenhum status foi encontrado. Os pedidos ficarão como PENDENTE CONSULTA.")
-                df_status = df_tratado[[COLUNA_PEDIDO]].drop_duplicates().copy()
-                df_status["STATUS_BANCO"] = "PENDENTE CONSULTA"
-                df_status["COD_STATUS_BANCO"] = ""
+    elif buscar:
+        st.warning("Nenhum arquivo encontrado para os filtros selecionados.")
 
-            df_status.columns = [str(c).strip().upper() for c in df_status.columns]
-            df_status["PEDIDO"] = df_status["PEDIDO"].apply(limpar_texto)
+    df_final = st.session_state.get("df_pedidos_empresa", pd.DataFrame())
 
-            df_final = df_tratado.merge(
-                df_status,
-                left_on=COLUNA_PEDIDO,
-                right_on="PEDIDO",
-                how="left",
+    if not df_final.empty:
+        st.divider()
+        st.subheader("3. Pedidos encontrados")
+
+        total_pedidos = len(df_final)
+        total_liberados = int((df_final["STATUS_BANCO"] == "LIBERADO").sum()) if "STATUS_BANCO" in df_final.columns else 0
+        total_nao_liberados = total_pedidos - total_liberados
+        total_valor = df_final[COLUNA_VALOR].fillna(0).sum() if COLUNA_VALOR in df_final.columns else 0
+
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Total de pedidos", total_pedidos)
+        m2.metric("Liberados", total_liberados)
+        m3.metric("Não liberados / pendentes", total_nao_liberados)
+        m4.metric("Valor total", formatar_moeda(total_valor))
+
+        st.dataframe(df_final, use_container_width=True, hide_index=True)
+
+        col_baixar, col_salvar = st.columns([1, 1])
+
+        with col_baixar:
+            excel = gerar_excel(df_final)
+            st.download_button(
+                "📥 Baixar Excel final",
+                data=excel,
+                file_name=f"{st.session_state.get('nome_carga', 'pedidos')}.xlsx".replace("/", "-"),
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             )
 
-            if "PEDIDO_y" in df_final.columns:
-                df_final = df_final.drop(columns=["PEDIDO_y"])
-
-            if "PEDIDO_x" in df_final.columns:
-                df_final = df_final.rename(columns={"PEDIDO_x": COLUNA_PEDIDO})
-
-            df_final["STATUS_BANCO"] = df_final["STATUS_BANCO"].fillna("NÃO ENCONTRADO")
-            df_final["COD_STATUS_BANCO"] = df_final["COD_STATUS_BANCO"].fillna("")
-
-            total_pedidos = len(df_final)
-            total_liberados = int((df_final["STATUS_BANCO"] == "LIBERADO").sum())
-            total_nao_liberados = total_pedidos - total_liberados
-            total_valor = df_final[COLUNA_VALOR].fillna(0).sum() if COLUNA_VALOR in df_final.columns else 0
-
-            st.subheader("Resumo da carga")
-            m1, m2, m3, m4 = st.columns(4)
-            m1.metric("Total de pedidos", total_pedidos)
-            m2.metric("Liberados", total_liberados)
-            m3.metric("Não liberados / pendentes", total_nao_liberados)
-            m4.metric("Valor total", f"R$ {total_valor:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
-
-            st.subheader("Resultado final")
-
-            st.dataframe(
-                df_final,
-                use_container_width=True,
-                hide_index=True,
-            )
-
-            col_baixar, col_salvar = st.columns([1, 1])
-
-            with col_baixar:
-                excel = gerar_excel(df_final)
-                st.download_button(
-                    "📥 Baixar Excel final",
-                    data=excel,
-                    file_name=f"{nome_carga or 'pedidos'}_final.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                )
-
-            with col_salvar:
-                if st.button("💾 Salvar carga no Neon", type="primary", use_container_width=True):
-                    if not nome_carga:
-                        st.warning("Informe o nome da carga antes de salvar.")
-                    elif not ok_conexao:
-                        st.error("Neon não conectado. Verifique o secrets.toml.")
-                    else:
-                        sucesso = salvar_carga_no_neon(
-                            df_final=df_final,
-                            nome_carga=nome_carga,
-                            nome_arquivo=arquivo.name,
-                            usuario_importacao=usuario_importacao,
-                        )
-                        if sucesso:
-                            st.success("Carga salva no Neon e histórico de liberados atualizado.")
-                            st.cache_data.clear()
-
-        except Exception as e:
-            st.error("Erro ao processar a planilha.")
-            st.code(str(e))
+        with col_salvar:
+            if st.button("💾 Salvar no Neon", type="primary", use_container_width=True):
+                if not ok_neon:
+                    st.error("Neon não conectado. Verifique os Secrets.")
+                else:
+                    sucesso = salvar_carga_no_neon(
+                        df_final=df_final,
+                        nome_carga=st.session_state.get("nome_carga", "Carga sem nome"),
+                        nome_arquivo=st.session_state.get("nome_arquivo_selecionado", ""),
+                        usuario_importacao=st.session_state.get("analista", usuario_importacao),
+                        departamento=st.session_state.get("departamento", ""),
+                        data_ini=st.session_state.get("data_ini", data_ini),
+                        data_fim=st.session_state.get("data_fim", data_fim),
+                    )
+                    if sucesso:
+                        st.success("Pedidos salvos no Neon e histórico de liberados atualizado.")
 
 
 with aba_historico:
-    if not ok_conexao:
+    if not ok_neon:
         st.warning("Conecte o Neon para visualizar o histórico.")
     else:
-        st.subheader("Cargas importadas")
-        df_cargas = carregar_cargas()
+        st.subheader("Cargas salvas no Neon")
+        df_cargas = carregar_cargas_neon()
 
         if df_cargas.empty:
-            st.info("Nenhuma carga importada ainda.")
+            st.info("Nenhuma carga salva ainda.")
         else:
             st.dataframe(df_cargas, use_container_width=True, hide_index=True)
 
         st.divider()
         st.subheader("Pedidos liberados mantidos no histórico")
-        df_hist = carregar_historico_liberados()
+        df_hist = carregar_historico_liberados_neon()
 
         if df_hist.empty:
             st.info("Nenhum pedido liberado salvo ainda.")
         else:
-            f1, f2, f3 = st.columns(3)
+            f1, f2, f3, f4 = st.columns(4)
             filtro_pedido = f1.text_input("Filtrar pedido")
             filtro_fornecedor = f2.text_input("Filtrar fornecedor")
-            filtro_loja = f3.text_input("Filtrar loja")
+            filtro_depto = f3.text_input("Filtrar departamento")
+            filtro_loja = f4.text_input("Filtrar loja")
 
             df_view = df_hist.copy()
-
             if filtro_pedido:
                 df_view = df_view[df_view["pedido"].astype(str).str.contains(filtro_pedido, case=False, na=False)]
-
             if filtro_fornecedor:
                 df_view = df_view[df_view["fornecedor"].astype(str).str.contains(filtro_fornecedor, case=False, na=False)]
-
+            if filtro_depto:
+                df_view = df_view[df_view["departamento"].astype(str).str.contains(filtro_depto, case=False, na=False)]
             if filtro_loja:
                 df_view = df_view[df_view["loja"].astype(str).str.contains(filtro_loja, case=False, na=False)]
 
             st.dataframe(df_view, use_container_width=True, hide_index=True)
-
             excel_hist = gerar_excel(df_view)
             st.download_button(
                 "📥 Baixar histórico de liberados",
@@ -838,47 +867,80 @@ with aba_historico:
 
 
 with aba_config:
-    st.subheader("Configuração esperada da planilha")
-
+    st.subheader("Como esse app funciona agora")
     st.markdown(
-        f"""
-        O app está configurado para procurar estas colunas:
+        """
+        Agora o app **não pede upload de planilha**.
 
-        - Pedido: `{COLUNA_PEDIDO}`
-        - Fornecedor: `{COLUNA_FORNECEDOR}`
-        - Loja: `{COLUNA_LOJA}`
-        - Valor: `{COLUNA_VALOR}`
-        - Status na planilha, se existir: `{COLUNA_STATUS_PLANILHA}`
+        O fluxo é:
+
+        1. Usuário escolhe **data inicial**, **data final** e **analista**.
+        2. O app mostra somente os **departamentos vinculados ao analista escolhido**.
+        3. O app consulta o banco da empresa e lista os **nomes dos arquivos importados**.
+        4. Usuário escolhe o **nome do arquivo**.
+        5. O app busca os pedidos daquele arquivo no banco da empresa.
+        6. O app salva a carga e mantém o histórico dos liberados no Neon/PostgreSQL.
         """
     )
 
-    st.warning(
-        "Se a sua planilha usa outro nome de coluna, altere as variáveis no começo do arquivo app_liberacao_pedidos.py."
-    )
-
-    st.subheader("Exemplo do secrets.toml")
+    st.subheader("Secrets necessários no Streamlit")
     st.code(
         '''[connections.postgresql]
-url = "postgresql://usuario:senha@host.neon.tech/neondb?sslmode=require"
+url = "postgresql://neondb_owner:SUA_SENHA@SEU_HOST.neon.tech/neondb?sslmode=require"
 
-# Opcional: somente quando a empresa liberar acesso ao Oracle/TOTVS
 [empresa_oracle]
-enabled = false
-user = "SEU_USUARIO"
-password = "SUA_SENHA"
+enabled = true
+user = "SEU_USUARIO_ORACLE"
+password = "SUA_SENHA_ORACLE"
 dsn = "host:1521/service"
-query_status = """
+
+# Opcional: se não configurar, o app deixa você digitar o departamento.
+query_departamentos = """
+SELECT DISTINCT
+    DEPARTAMENTO
+FROM SUA_TABELA_DE_IMPORTACAO
+WHERE DATA_IMPORTACAO >= TO_DATE(:data_ini, 'YYYY-MM-DD')
+  AND DATA_IMPORTACAO <  TO_DATE(:data_fim, 'YYYY-MM-DD') + 1
+ORDER BY DEPARTAMENTO
+"""
+
+# Obrigatório: precisa retornar NOME_ARQUIVO.
+query_arquivos = """
+SELECT DISTINCT
+    NOME_ARQUIVO,
+    MAX(DATA_IMPORTACAO) AS DATA_IMPORTACAO,
+    COUNT(DISTINCT PEDIDO) AS QTD_PEDIDOS
+FROM SUA_TABELA_DE_IMPORTACAO
+WHERE DATA_IMPORTACAO >= TO_DATE(:data_ini, 'YYYY-MM-DD')
+  AND DATA_IMPORTACAO <  TO_DATE(:data_fim, 'YYYY-MM-DD') + 1
+  AND (:departamento = 'TODOS' OR DEPARTAMENTO = :departamento)
+GROUP BY NOME_ARQUIVO
+ORDER BY MAX(DATA_IMPORTACAO) DESC
+"""
+
+# Obrigatório: precisa retornar pelo menos PEDIDO.
+# Recomendado retornar também FORNECEDOR, LOJA, VALOR, DEPARTAMENTO, NOME_ARQUIVO, STATUS_BANCO e COD_STATUS_BANCO.
+query_pedidos = """
 SELECT
-    C7_NUM AS PEDIDO,
+    PEDIDO,
+    FORNECEDOR,
+    LOJA,
+    VALOR,
+    DEPARTAMENTO,
+    NOME_ARQUIVO,
+    DATA_IMPORTACAO,
     CASE
-        WHEN C7_CONAPRO = 'L' THEN 'LIBERADO'
-        WHEN C7_CONAPRO = 'B' THEN 'BLOQUEADO'
+        WHEN COD_STATUS = 'L' THEN 'LIBERADO'
+        WHEN COD_STATUS = 'B' THEN 'BLOQUEADO'
         ELSE 'NÃO LIBERADO'
     END AS STATUS_BANCO,
-    C7_CONAPRO AS COD_STATUS_BANCO
-FROM TOTVS.SC7010
-WHERE D_E_L_E_T_ = ' '
-  AND C7_NUM IN ({placeholders})
+    COD_STATUS AS COD_STATUS_BANCO
+FROM SUA_TABELA_DE_IMPORTACAO
+WHERE DATA_IMPORTACAO >= TO_DATE(:data_ini, 'YYYY-MM-DD')
+  AND DATA_IMPORTACAO <  TO_DATE(:data_fim, 'YYYY-MM-DD') + 1
+  AND (:departamento = 'TODOS' OR DEPARTAMENTO = :departamento)
+  AND NOME_ARQUIVO = :nome_arquivo
+ORDER BY PEDIDO
 """
 ''',
         language="toml",
@@ -894,4 +956,8 @@ psycopg2-binary
 oracledb
 """,
         language="txt",
+    )
+
+    st.warning(
+        "Importante: se o banco da empresa for interno/VPN, o Streamlit Cloud só vai conseguir acessar se a empresa liberar acesso externo. Caso contrário, esse app precisa rodar dentro da rede da empresa ou atrás de uma API interna."
     )
