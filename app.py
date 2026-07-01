@@ -42,40 +42,36 @@ VALORES_STATUS_LIBERADO = {"L", "LIBERADO", "LIBERADA", "APROVADO", "APROVADA", 
 
 ANALISTAS = {
     "Cleviton": [
-        "Portas e Janelas", "Ferramentas", "Ferragens", "Automotivos"
+        "PORTAS E JANELAS", "FERRAMENTAS", "FERRAGENS", "AUTOMOTIVOS"
     ],
     "Alec": [
-        "Eletrica", "Iluminacao", "Hidraulica"
+        "ELETRICA", "ILUMINACAO", "HIDRAULICA"
     ],
     "Jonatas": [
-        "Moveis e Colchoes", "Decoracao", "Cama Mesa e Banho", "Lazer",
-        "Casa e UD", "Jardim",
+        "MOVEIS E COLCHOES", "DECORACAO", "CAMA MESA E BANHO", "LAZER",
+        "CASA E UD", "JARDIM",
     ],
     "Beatriz": [
-        "Eletro", "Tecnologia", "Climatizacao"
+        "ELETRO", "TECNOLOGIA", "CLIMATIZACAO"
     ],
     "Ruan": [
-        "Tintas", "Organizacao da Casa"
+        "TINTAS", "ORGANIZACAO DA CASA"
     ],
     "Jessica": [
-        "Materiais de Construcao", "Banho e Cozinha"
+        "MATERIAIS DE CONSTRUCAO", "BANHO E COZINHA"
     ],
     "Rose": [
-        "Pisos e Revestimento"
+        "PISOS E REVESTIMENTO"
     ],
 }
 
 
-def get_todos_departamentos():
-    departamentos = []
-    for lista in ANALISTAS.values():
-        for depto in lista:
-            if depto not in departamentos:
-                departamentos.append(depto)
-    return sorted(departamentos)
+TODOS_DEPARTAMENTOS = sorted({
+    departamento
+    for departamentos in ANALISTAS.values()
+    for departamento in departamentos
+})
 
-
-TODOS_DEPARTAMENTOS = get_todos_departamentos()
 
 
 # =========================================================
@@ -203,7 +199,7 @@ def preparar_sql_departamentos(departamentos, params):
     for i, depto in enumerate(departamentos):
         chave = f"depto_{i}"
         placeholders.append(f":{chave}")
-        params[chave] = depto
+        params[chave] = limpar_texto(depto).upper()
     return ", ".join(placeholders)
 
 
@@ -431,7 +427,7 @@ WHERE C7.D_E_L_E_T_ = ' '
   AND C7.C7_CONAPRO IN ('L','B')
   AND C7.C7_EMISSAO >= :data_ini_yyyymmdd
   AND C7.C7_EMISSAO <= :data_fim_yyyymmdd
-  AND TRIM(B1.B1_XGCDDE) IN ({depto_placeholders})
+  AND UPPER(TRIM(B1.B1_XGCDDE)) IN ({depto_placeholders})
   AND TRIM(BG.ZBG_NOMEAR) IS NOT NULL
   {filtro_arquivo}
 """
