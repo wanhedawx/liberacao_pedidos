@@ -3,6 +3,7 @@ from datetime import date, datetime, timedelta
 from io import BytesIO
 
 import pandas as pd
+import requests
 import streamlit as st
 from sqlalchemy import create_engine, text
 from sqlalchemy.exc import SQLAlchemyError
@@ -20,7 +21,7 @@ st.set_page_config(
 
 
 # =========================================================
-# COLUNAS PADRÃO QUE A QUERY ABAIXO RETORNA
+# COLUNAS PADRÃO QUE A API RETORNA
 # =========================================================
 
 COLUNA_PEDIDO = "PEDIDO"
@@ -36,8 +37,6 @@ VALORES_STATUS_LIBERADO = {"L", "LIBERADO", "LIBERADA", "APROVADO", "APROVADA", 
 
 # =========================================================
 # ANALISTAS E DEPARTAMENTOS FIXOS
-# O usuário escolhe o analista e o app já traz os departamentos dele marcados,
-# mas o campo Departamento é MULTISELECT e permite escolher outros também.
 # =========================================================
 
 ANALISTAS = {
@@ -65,13 +64,11 @@ ANALISTAS = {
     ],
 }
 
-
 TODOS_DEPARTAMENTOS = sorted({
     departamento
     for departamentos in ANALISTAS.values()
     for departamento in departamentos
 })
-
 
 
 # =========================================================
@@ -182,27 +179,6 @@ def formatar_moeda(valor):
         return "R$ 0,00"
 
 
-
-def fmt_data_protheus(dt):
-    return dt.strftime("%Y%m%d")
-
-
-
-def parse_enabled(valor):
-    return str(valor).strip().lower() in {"true", "1", "sim", "s", "yes", "y"}
-
-
-
-def preparar_sql_departamentos(departamentos, params):
-    """Cria placeholders Oracle para MULTISELECT de departamentos."""
-    placeholders = []
-    for i, depto in enumerate(departamentos):
-        chave = f"depto_{i}"
-        placeholders.append(f":{chave}")
-        params[chave] = limpar_texto(depto).upper()
-    return ", ".join(placeholders)
-
-
 # =========================================================
 # CONEXÃO COM NEON / POSTGRESQL DO APP
 # =========================================================
@@ -308,211 +284,127 @@ def criar_tabelas_neon():
 
 
 # =========================================================
-# CONEXÃO COM BANCO DA EMPRESA / ORACLE
+# CONEXÃO COM API DA EMPRESA / FASTAPI
 # =========================================================
 
 
-def get_empresa_cfg():
+def get_empresa_api_cfg():
     try:
-        return st.secrets["empresa_oracle"]
+        return st.secrets["empresa_api"]
     except Exception:
         return None
 
 
 
-def empresa_habilitada():
-    cfg = get_empresa_cfg()
+def get_api_base_url():
+    cfg = get_empresa_api_cfg()
     if cfg is None:
-        return False, "Configuração [empresa_oracle] não encontrada nos Secrets."
+        return None
+    return str(cfg.get("url", "")).rstrip("/")
 
-    if not parse_enabled(cfg.get("enabled", False)):
-        return False, "Banco da empresa está com enabled = false nos Secrets."
 
-    campos = ["user", "password", "dsn"]
-    faltando = [c for c in campos if not cfg.get(c)]
-    if faltando:
-        return False, f"Configuração incompleta em [empresa_oracle]. Faltando: {', '.join(faltando)}"
+
+def get_api_token():
+    cfg = get_empresa_api_cfg()
+    if cfg is None:
+        return None
+    return str(cfg.get("token", ""))
+
+
+
+def api_habilitada():
+    cfg = get_empresa_api_cfg()
+    if cfg is None:
+        return False, "Configuração [empresa_api] não encontrada nos Secrets."
+
+    url = get_api_base_url()
+    token = get_api_token()
+
+    if not url:
+        return False, "URL da API não encontrada em [empresa_api]."
+
+    if not token:
+        return False, "Token da API não encontrado em [empresa_api]."
 
     return True, "Configuração OK"
 
 
-@st.cache_resource(show_spinner=False)
-def get_oracle_connection(user, password, dsn):
-    import oracledb
-    return oracledb.connect(user=user, password=password, dsn=dsn)
+
+def chamar_api(method, path, payload=None, timeout=180):
+    ok, msg = api_habilitada()
+    if not ok:
+        raise RuntimeError(msg)
+
+    base_url = get_api_base_url()
+    token = get_api_token()
+    url = f"{base_url}{path}"
+
+    headers = {
+        "x-api-key": token,
+        "Content-Type": "application/json",
+    }
+
+    if method.upper() == "GET":
+        response = requests.get(url, headers=headers, timeout=timeout)
+    else:
+        response = requests.post(url, headers=headers, json=payload or {}, timeout=timeout)
+
+    if response.status_code >= 400:
+        try:
+            detalhe = response.json()
+        except Exception:
+            detalhe = response.text
+        raise RuntimeError(f"Erro API {response.status_code}: {detalhe}")
+
+    return response.json()
 
 
 
-def testar_conexao_empresa():
-    ok, msg = empresa_habilitada()
+def testar_conexao_api():
+    ok, msg = api_habilitada()
     if not ok:
         return False, msg
 
     try:
-        import oracledb  # noqa: F401
-    except ImportError:
-        return False, "Biblioteca oracledb não instalada. Confira o requirements.txt."
-
-    cfg = get_empresa_cfg()
-
-    try:
-        conn = get_oracle_connection(cfg.get("user"), cfg.get("password"), cfg.get("dsn"))
-        cursor = conn.cursor()
-        cursor.execute("SELECT 1 FROM DUAL")
-        cursor.fetchone()
-        cursor.close()
-        return True, "Conexão OK"
+        retorno = chamar_api("GET", "/health", timeout=30)
+        status = retorno.get("status", "") if isinstance(retorno, dict) else ""
+        if str(status).lower() == "ok":
+            return True, "Conexão OK"
+        return False, f"API respondeu, mas status inesperado: {retorno}"
     except Exception as e:
         return False, str(e)
 
 
-
-def executar_query_empresa(sql, params):
-    cfg = get_empresa_cfg()
-    if cfg is None:
-        st.error("Configuração [empresa_oracle] não encontrada nos Secrets.")
-        return pd.DataFrame()
-
-    try:
-        conn = get_oracle_connection(cfg.get("user"), cfg.get("password"), cfg.get("dsn"))
-        df = pd.read_sql(sql, conn, params=params)
-        df.columns = [str(c).strip().upper() for c in df.columns]
-        return df
-    except Exception as e:
-        st.error("Erro ao executar consulta no banco da empresa.")
-        st.code(str(e))
-        return pd.DataFrame()
-
-
 # =========================================================
-# QUERY CHUMBADA DO BANCO DA EMPRESA
-# Baseada na query enviada. Corrigi o alias LIBERADO? para STATUS_BANCO/COD_STATUS_BANCO
-# e usei C7_CONAPRO, que também está no WHERE.
+# CONSULTAS VIA API
 # =========================================================
-
-
-def sql_base_from_where(depto_placeholders, incluir_arquivo=False):
-    filtro_arquivo = ""
-    if incluir_arquivo:
-        filtro_arquivo = "\n  AND TRIM(BG.ZBG_NOMEAR) = :nome_arquivo"
-
-    return f"""
-FROM SC7010 C7
-LEFT JOIN (
-    SELECT DISTINCT
-        ZBG_TIPO,
-        ZBG_PEDPAI,
-        ZBG_FILORI,
-        ZBG_FILDES,
-        ZBG_CODPRO,
-        ZBG_PEDVEN,
-        ZBG_NOMEAR
-    FROM TOTVS.ZBG010 BG
-    WHERE BG.D_E_L_E_T_ = ' '
-) BG ON
-    BG.ZBG_PEDPAI = C7.C7_NUM
-    AND BG.ZBG_CODPRO = C7.C7_PRODUTO
-LEFT JOIN SB1010 B1 ON
-    B1.B1_FILIAL = '    '
-    AND B1.B1_COD = C7.C7_PRODUTO
-    AND B1.D_E_L_E_T_ = ' '
-LEFT JOIN SA2010 A2 ON
-    A2.A2_FILIAL = '    '
-    AND A2.A2_COD = C7.C7_FORNECE
-    AND A2.A2_LOJA = C7.C7_LOJA
-    AND A2.D_E_L_E_T_ = ' '
-WHERE C7.D_E_L_E_T_ = ' '
-  AND C7.C7_XTPPED IN ('Q','D','B')
-  AND C7.C7_RESIDUO = ' '
-  AND C7.C7_CONAPRO IN ('L','B')
-  AND C7.C7_EMISSAO >= :data_ini_yyyymmdd
-  AND C7.C7_EMISSAO <= :data_fim_yyyymmdd
-  AND UPPER(TRIM(B1.B1_XGCDDE)) IN ({depto_placeholders})
-  AND TRIM(BG.ZBG_NOMEAR) IS NOT NULL
-  {filtro_arquivo}
-"""
-
-
-
-def montar_query_arquivos(departamentos, data_ini, data_fim):
-    params = {
-        "data_ini_yyyymmdd": fmt_data_protheus(data_ini),
-        "data_fim_yyyymmdd": fmt_data_protheus(data_fim),
-    }
-    depto_placeholders = preparar_sql_departamentos(departamentos, params)
-
-    sql = f"""
-SELECT
-    TRIM(BG.ZBG_NOMEAR) AS NOME_ARQUIVO,
-    COUNT(DISTINCT C7.C7_NUM) AS QTD_PEDIDOS,
-    COUNT(DISTINCT CASE WHEN C7.C7_CONAPRO = 'L' THEN C7.C7_NUM END) AS QTD_LIBERADOS,
-    COUNT(DISTINCT CASE WHEN C7.C7_CONAPRO = 'B' THEN C7.C7_NUM END) AS QTD_BLOQUEADOS,
-    MIN(C7.C7_EMISSAO) AS PRIMEIRA_EMISSAO,
-    MAX(C7.C7_EMISSAO) AS ULTIMA_EMISSAO
-{sql_base_from_where(depto_placeholders, incluir_arquivo=False)}
-GROUP BY TRIM(BG.ZBG_NOMEAR)
-ORDER BY MAX(C7.C7_EMISSAO) DESC, TRIM(BG.ZBG_NOMEAR)
-"""
-    return sql, params
-
-
-
-def montar_query_pedidos(departamentos, data_ini, data_fim, nome_arquivo):
-    params = {
-        "data_ini_yyyymmdd": fmt_data_protheus(data_ini),
-        "data_fim_yyyymmdd": fmt_data_protheus(data_fim),
-        "nome_arquivo": nome_arquivo,
-    }
-    depto_placeholders = preparar_sql_departamentos(departamentos, params)
-
-    sql = f"""
-SELECT
-    CASE
-        WHEN BG.ZBG_TIPO = '1' THEN 'TIPO_FORNECEDOR'
-        WHEN BG.ZBG_TIPO = '2' THEN 'TIPO_LOJA'
-        ELSE 'NAOMISTO'
-    END AS TIPO,
-    C7.C7_FILIAL AS FILIAL,
-    C7.C7_NUM AS PEDIDO,
-    (A2.A2_COD || '/' || A2.A2_LOJA || ' - ' || A2.A2_NREDUZ) AS FORNECEDOR,
-    TRIM(B1.B1_XGCDDE) AS DEPARTAMENTO,
-    BG.ZBG_PEDVEN AS PEDIDO_CROSS,
-    BG.ZBG_FILDES AS FILIAL_CROSS,
-    TRIM(C7.C7_PRODUTO) AS PRODUTO,
-    C7.C7_DESCRI AS DESCRICAO,
-    C7.C7_QUANT AS QUANTIDADE,
-    C7.C7_PRECO AS VALOR_UNITARIO,
-    C7.C7_TOTAL AS VALOR_TOTAL,
-    C7.C7_EMISSAO AS DT_EMISSAO,
-    CASE
-        WHEN C7.C7_CONAPRO = 'L' THEN 'LIBERADO'
-        WHEN C7.C7_CONAPRO = 'B' THEN 'BLOQUEADO'
-        ELSE 'NÃO LIBERADO'
-    END AS STATUS_BANCO,
-    C7.C7_CONAPRO AS COD_STATUS_BANCO,
-    TRIM(BG.ZBG_NOMEAR) AS NOME_ARQUIVO
-{sql_base_from_where(depto_placeholders, incluir_arquivo=True)}
-ORDER BY
-    TRIM(B1.B1_XGCDDE),
-    C7.C7_NUM,
-    TRIM(C7.C7_PRODUTO)
-"""
-    return sql, params
-
 
 
 def carregar_arquivos_empresa(data_ini, data_fim, departamentos):
     if not departamentos:
         return pd.DataFrame()
 
-    sql, params = montar_query_arquivos(departamentos, data_ini, data_fim)
-    df = executar_query_empresa(sql, params)
+    payload = {
+        "data_inicial": data_ini.isoformat(),
+        "data_final": data_fim.isoformat(),
+        "departamentos": [limpar_texto(d).upper() for d in departamentos],
+    }
+
+    try:
+        retorno = chamar_api("POST", "/arquivos", payload=payload)
+        dados = retorno.get("dados", []) if isinstance(retorno, dict) else []
+        df = pd.DataFrame(dados)
+        df.columns = [str(c).strip().upper() for c in df.columns]
+    except Exception as e:
+        st.error("Erro ao buscar arquivos na API da empresa.")
+        st.code(str(e))
+        return pd.DataFrame()
 
     if df.empty:
         return df
 
     if COLUNA_NOME_ARQUIVO not in df.columns:
-        st.error("A consulta precisa retornar a coluna NOME_ARQUIVO.")
+        st.error("A API precisa retornar a coluna NOME_ARQUIVO.")
         return pd.DataFrame()
 
     df[COLUNA_NOME_ARQUIVO] = df[COLUNA_NOME_ARQUIVO].apply(limpar_texto)
@@ -525,14 +417,28 @@ def carregar_pedidos_empresa(data_ini, data_fim, departamentos, nome_arquivo):
     if not departamentos or not nome_arquivo:
         return pd.DataFrame()
 
-    sql, params = montar_query_pedidos(departamentos, data_ini, data_fim, nome_arquivo)
-    df = executar_query_empresa(sql, params)
+    payload = {
+        "data_inicial": data_ini.isoformat(),
+        "data_final": data_fim.isoformat(),
+        "departamentos": [limpar_texto(d).upper() for d in departamentos],
+        "nome_arquivo": limpar_texto(nome_arquivo),
+    }
+
+    try:
+        retorno = chamar_api("POST", "/pedidos", payload=payload)
+        dados = retorno.get("dados", []) if isinstance(retorno, dict) else []
+        df = pd.DataFrame(dados)
+        df.columns = [str(c).strip().upper() for c in df.columns]
+    except Exception as e:
+        st.error("Erro ao buscar pedidos na API da empresa.")
+        st.code(str(e))
+        return pd.DataFrame()
 
     if df.empty:
         return df
 
     if COLUNA_PEDIDO not in df.columns:
-        st.error("A consulta precisa retornar a coluna PEDIDO.")
+        st.error("A API precisa retornar a coluna PEDIDO.")
         return pd.DataFrame()
 
     df[COLUNA_PEDIDO] = df[COLUNA_PEDIDO].apply(limpar_texto)
@@ -761,12 +667,12 @@ def carregar_historico_liberados_neon():
 
 st.markdown('<div class="titulo-principal">📦 Liberação de Pedidos</div>', unsafe_allow_html=True)
 st.markdown(
-    '<div class="subtitulo">Consulta direto no banco da empresa por data, analista, múltiplos departamentos e nome do arquivo importado. Depois salva o histórico no Neon/PostgreSQL.</div>',
+    '<div class="subtitulo">Consulta via API FastAPI por data, analista, múltiplos departamentos e nome do arquivo importado. Depois salva o histórico no Neon/PostgreSQL.</div>',
     unsafe_allow_html=True,
 )
 
 ok_neon, msg_neon = testar_conexao_neon()
-ok_empresa, msg_empresa = testar_conexao_empresa()
+ok_api, msg_api = testar_conexao_api()
 
 with st.sidebar:
     st.header("Conexões")
@@ -778,11 +684,11 @@ with st.sidebar:
         st.error("Neon não conectado")
         st.caption(msg_neon)
 
-    if ok_empresa:
-        st.success("Banco da empresa conectado")
+    if ok_api:
+        st.success("API da empresa conectada")
     else:
-        st.error("Banco da empresa não conectado")
-        st.caption(msg_empresa)
+        st.error("API da empresa não conectada")
+        st.caption(msg_api)
 
     st.divider()
     usuario_importacao = st.text_input("Usuário", value="Vitoria")
@@ -829,11 +735,11 @@ with aba_consulta:
     buscar = st.button(
         "🔎 Buscar arquivos importados",
         type="primary",
-        disabled=(not ok_empresa or not departamentos_selecionados),
+        disabled=(not ok_api or not departamentos_selecionados),
     )
 
     if buscar:
-        with st.spinner("Buscando arquivos importados no banco da empresa..."):
+        with st.spinner("Buscando arquivos importados pela API da empresa..."):
             st.session_state["df_arquivos_empresa"] = carregar_arquivos_empresa(
                 data_ini,
                 data_fim,
@@ -863,7 +769,7 @@ with aba_consulta:
         nome_carga = st.text_input("Nome para salvar no histórico do Neon", value=nome_carga_sugerido)
 
         if st.button("📥 Carregar pedidos desse arquivo", type="primary"):
-            with st.spinner("Carregando pedidos do arquivo selecionado..."):
+            with st.spinner("Carregando pedidos do arquivo selecionado pela API..."):
                 df_pedidos = carregar_pedidos_empresa(
                     data_ini,
                     data_fim,
@@ -981,26 +887,23 @@ with aba_config:
     st.subheader("O que foi ajustado")
     st.markdown(
         """
-        - O campo **Departamento** agora é **multiselect**.
+        - O Streamlit agora consulta o banco da empresa por meio da **API FastAPI**.
+        - O Streamlit não conecta mais direto no Oracle.
+        - O campo **Departamento** é **multiselect**.
         - Os departamentos do analista já vêm **pré-selecionados**.
         - O usuário pode marcar/remover qualquer outro departamento.
-        - A query do banco da empresa ficou **chumbada no código**.
-        - O filtro de data usa `C7_EMISSAO` no padrão `YYYYMMDD`.
-        - O nome do arquivo vem de `ZBG_NOMEAR`, retornando como `NOME_ARQUIVO`.
-        - O status vem de `C7_CONAPRO`: `L = LIBERADO` e `B = BLOQUEADO`.
+        - O histórico continua sendo salvo no **Neon/PostgreSQL**.
         """
     )
 
-    st.subheader("Secrets necessários no Streamlit")
+    st.subheader("Secrets necessários no Streamlit local")
     st.code(
         '''[connections.postgresql]
 url = "postgresql://neondb_owner:SUA_SENHA@SEU_HOST.neon.tech/neondb?sslmode=require"
 
-[empresa_oracle]
-enabled = true
-user = "SEU_USUARIO_ORACLE"
-password = "SUA_SENHA_ORACLE"
-dsn = "host:1521/service"
+[empresa_api]
+url = "http://localhost:8000"
+token = "SEU_API_TOKEN"
 ''',
         language="toml",
     )
@@ -1012,11 +915,11 @@ pandas
 openpyxl
 sqlalchemy
 psycopg2-binary
-oracledb
+requests
 """,
         language="txt",
     )
 
     st.warning(
-        "Se o banco da empresa for interno/VPN, o Streamlit Cloud só vai conectar se a empresa liberar acesso externo. Caso contrário, rode o app dentro da rede da empresa ou atrás de uma API interna."
+        "Para testar localmente, deixe a API FastAPI rodando em outro terminal. Para usar no Streamlit Cloud, a API precisa estar publicada em uma URL acessível pelo Cloud."
     )
