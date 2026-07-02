@@ -44,16 +44,16 @@ MAPA_COD_DEMANDA = {
     "B": "DEMANDA VENDA JURIDICA",
 }
 
-COLUNA_VALOR_TIPO1_TOTAL = "VALOR_TIPO1_TOTAL"
-COLUNAS_VALOR_TIPO1_DEMANDA = {
-    "DEMANDA PUXADA": "VALOR_PUXADA_TIPO1",
-    "DEMANDA EMPURRADA": "VALOR_EMPURRADA_TIPO1",
-    "DEMANDA VENDA JURIDICA": "VALOR_VENDA_JURIDICA_TIPO1",
+COLUNA_VALOR_TIPO2_TOTAL = "VALOR_TIPO2_TOTAL"
+COLUNAS_VALOR_TIPO2_DEMANDA = {
+    "DEMANDA PUXADA": "VALOR_PUXADA_TIPO2",
+    "DEMANDA EMPURRADA": "VALOR_EMPURRADA_TIPO2",
+    "DEMANDA VENDA JURIDICA": "VALOR_VENDA_JURIDICA_TIPO2",
 }
-COLUNAS_QTD_TIPO1_DEMANDA = {
-    "DEMANDA PUXADA": "QTD_PUXADA_TIPO1",
-    "DEMANDA EMPURRADA": "QTD_EMPURRADA_TIPO1",
-    "DEMANDA VENDA JURIDICA": "QTD_VENDA_JURIDICA_TIPO1",
+COLUNAS_QTD_TIPO2_DEMANDA = {
+    "DEMANDA PUXADA": "QTD_PUXADA_TIPO2",
+    "DEMANDA EMPURRADA": "QTD_EMPURRADA_TIPO2",
+    "DEMANDA VENDA JURIDICA": "QTD_VENDA_JURIDICA_TIPO2",
 }
 
 
@@ -195,16 +195,16 @@ def formatar_moeda(valor):
         return "R$ 0,00"
 
 
-def valor_tipo1_por_demanda(linha_arquivo, demanda):
-    """Retorna a soma correta da importação pela query: ZBG_TIPO = '1' + demanda selecionada."""
-    coluna = COLUNAS_VALOR_TIPO1_DEMANDA.get(demanda)
+def valor_tipo2_por_demanda(linha_arquivo, demanda):
+    """Retorna a soma correta da importação: tipo loja (ZBG_TIPO = '2') + pedidos NÃO MISTO, por demanda selecionada."""
+    coluna = COLUNAS_VALOR_TIPO2_DEMANDA.get(demanda)
     if not coluna or coluna not in linha_arquivo.index:
         return 0.0
     return limpar_valor(linha_arquivo.get(coluna)) or 0.0
 
 
-def qtd_tipo1_por_demanda(linha_arquivo, demanda):
-    coluna = COLUNAS_QTD_TIPO1_DEMANDA.get(demanda)
+def qtd_tipo2_por_demanda(linha_arquivo, demanda):
+    coluna = COLUNAS_QTD_TIPO2_DEMANDA.get(demanda)
     if not coluna or coluna not in linha_arquivo.index:
         return 0
     try:
@@ -1136,7 +1136,7 @@ with aba_consulta:
         nome_arquivo = st.selectbox("Nome do arquivo importado", options=arquivos)
 
         st.subheader("3. Classificação antes de importar")
-        st.caption("Antes de carregar os pedidos, selecione se o arquivo é Puxada, Empurrada ou Venda Jurídica. O valor correto vem da query, somando somente ZBG_TIPO = '1'.")
+        st.caption("Antes de carregar os pedidos, selecione se o arquivo é Puxada, Empurrada ou Venda Jurídica. O valor correto vem da query, somando tipo loja (ZBG_TIPO = '2') + pedidos NÃO MISTO.")
 
         col_tipo_demanda, col_valor_demanda, col_qtd_demanda = st.columns([1.2, 1, 1])
         with col_tipo_demanda:
@@ -1147,14 +1147,14 @@ with aba_consulta:
             )
 
         linha_arquivo = df_arquivos[df_arquivos[COLUNA_NOME_ARQUIVO] == nome_arquivo].iloc[0]
-        valor_informado_importacao = valor_tipo1_por_demanda(linha_arquivo, tipo_demanda_importacao)
-        qtd_tipo1_demanda = qtd_tipo1_por_demanda(linha_arquivo, tipo_demanda_importacao)
+        valor_informado_importacao = valor_tipo2_por_demanda(linha_arquivo, tipo_demanda_importacao)
+        qtd_tipo2_demanda = qtd_tipo2_por_demanda(linha_arquivo, tipo_demanda_importacao)
 
         with col_valor_demanda:
             st.metric("Valor correto da query", formatar_moeda(valor_informado_importacao))
-            st.caption("Soma de C7_TOTAL com ZBG_TIPO = '1'.")
+            st.caption("Soma de C7_TOTAL com tipo loja (ZBG_TIPO = '2') + pedidos NÃO MISTO.")
         with col_qtd_demanda:
-            st.metric("Pedidos tipo 1", qtd_tipo1_demanda)
+            st.metric("Pedidos loja + não misto", qtd_tipo2_demanda)
             st.caption("Quantidade de pedidos nessa demanda.")
 
         nome_carga_sugerido = (
@@ -1164,7 +1164,7 @@ with aba_consulta:
         nome_carga = st.text_input("Nome para salvar no histórico do Neon", value=nome_carga_sugerido)
 
         if valor_informado_importacao <= 0:
-            st.warning("A query não encontrou valor tipo 1 para essa demanda neste arquivo. Verifique se o tipo selecionado está correto.")
+            st.warning("A query não encontrou valor para tipo loja + não misto nesta demanda/arquivo. Verifique se o tipo selecionado está correto.")
 
         if st.button("📥 Carregar pedidos desse arquivo", type="primary", disabled=(valor_informado_importacao <= 0)):
             with st.spinner("Carregando pedidos do arquivo selecionado pela API..."):
@@ -1179,7 +1179,7 @@ with aba_consulta:
                 if not df_pedidos.empty:
                     df_pedidos[COLUNA_DEMANDA] = tipo_demanda_importacao
                     df_pedidos["VALOR_INFORMADO_IMPORTACAO"] = float(valor_informado_importacao)
-                    df_pedidos["VALOR_REFERENCIA_TIPO1_QUERY"] = float(valor_informado_importacao)
+                    df_pedidos["VALOR_REFERENCIA_LOJA_NAOMISTO_QUERY"] = float(valor_informado_importacao)
                     df_pedidos["TIPO_IMPORTACAO"] = tipo_demanda_importacao
 
                 st.session_state["df_pedidos_empresa"] = df_pedidos
@@ -1247,12 +1247,12 @@ with aba_consulta:
         m4.metric("Bloqueados", int(total_bloqueados))
         m5.metric("Removidos", len(pedidos_remover))
         m6.metric("Soma pedidos", formatar_moeda(total_valor))
-        m7.metric("Valor query tipo 1", formatar_moeda(valor_informado_importacao))
+        m7.metric("Valor query tipo loja + não misto", formatar_moeda(valor_informado_importacao))
         m8.metric("Diferença", formatar_moeda(diferenca_valor))
 
         if abs(diferenca_valor) > 0.01:
             st.warning(
-                f"A soma dos pedidos carregados ({formatar_moeda(total_valor)}) está diferente do valor da query tipo 1 "
+                f"A soma dos pedidos carregados ({formatar_moeda(total_valor)}) está diferente do valor da query tipo loja + não misto "
                 f"({formatar_moeda(valor_informado_importacao)}). Diferença: {formatar_moeda(diferenca_valor)}."
             )
 
