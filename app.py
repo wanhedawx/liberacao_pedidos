@@ -44,6 +44,18 @@ MAPA_COD_DEMANDA = {
     "B": "DEMANDA VENDA JURIDICA",
 }
 
+COLUNA_VALOR_TIPO1_TOTAL = "VALOR_TIPO1_TOTAL"
+COLUNAS_VALOR_TIPO1_DEMANDA = {
+    "DEMANDA PUXADA": "VALOR_PUXADA_TIPO1",
+    "DEMANDA EMPURRADA": "VALOR_EMPURRADA_TIPO1",
+    "DEMANDA VENDA JURIDICA": "VALOR_VENDA_JURIDICA_TIPO1",
+}
+COLUNAS_QTD_TIPO1_DEMANDA = {
+    "DEMANDA PUXADA": "QTD_PUXADA_TIPO1",
+    "DEMANDA EMPURRADA": "QTD_EMPURRADA_TIPO1",
+    "DEMANDA VENDA JURIDICA": "QTD_VENDA_JURIDICA_TIPO1",
+}
+
 
 # =========================================================
 # ANALISTAS E DEPARTAMENTOS FIXOS
@@ -181,6 +193,24 @@ def formatar_moeda(valor):
         return f"R$ {float(valor):,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
     except Exception:
         return "R$ 0,00"
+
+
+def valor_tipo1_por_demanda(linha_arquivo, demanda):
+    """Retorna a soma correta da importação pela query: ZBG_TIPO = '1' + demanda selecionada."""
+    coluna = COLUNAS_VALOR_TIPO1_DEMANDA.get(demanda)
+    if not coluna or coluna not in linha_arquivo.index:
+        return 0.0
+    return limpar_valor(linha_arquivo.get(coluna)) or 0.0
+
+
+def qtd_tipo1_por_demanda(linha_arquivo, demanda):
+    coluna = COLUNAS_QTD_TIPO1_DEMANDA.get(demanda)
+    if not coluna or coluna not in linha_arquivo.index:
+        return 0
+    try:
+        return int(float(linha_arquivo.get(coluna) or 0))
+    except Exception:
+        return 0
 
 
 
@@ -456,6 +486,10 @@ def criar_tabelas_neon():
     ALTER TABLE cargas_importacao ADD COLUMN IF NOT EXISTS filtro_data_ini DATE;
     ALTER TABLE cargas_importacao ADD COLUMN IF NOT EXISTS filtro_data_fim DATE;
     ALTER TABLE cargas_importacao ADD COLUMN IF NOT EXISTS analista TEXT;
+    ALTER TABLE cargas_importacao ADD COLUMN IF NOT EXISTS demanda_importacao TEXT;
+    ALTER TABLE cargas_importacao ADD COLUMN IF NOT EXISTS valor_informado NUMERIC(14,2);
+    ALTER TABLE cargas_importacao ADD COLUMN IF NOT EXISTS valor_total_calculado NUMERIC(14,2);
+    ALTER TABLE cargas_importacao ADD COLUMN IF NOT EXISTS diferenca_valor NUMERIC(14,2);
     ALTER TABLE pedidos_importados ADD COLUMN IF NOT EXISTS departamento TEXT;
     ALTER TABLE pedidos_importados ADD COLUMN IF NOT EXISTS nome_arquivo_origem TEXT;
     ALTER TABLE pedidos_importados ADD COLUMN IF NOT EXISTS demanda TEXT;
@@ -603,7 +637,7 @@ def carregar_arquivos_empresa(data_ini, data_fim, departamentos):
 
 
 
-def carregar_pedidos_empresa(data_ini, data_fim, departamentos, nome_arquivo):
+def carregar_pedidos_empresa(data_ini, data_fim, departamentos, nome_arquivo, demanda):
     if not departamentos or not nome_arquivo:
         return pd.DataFrame()
 
@@ -612,6 +646,7 @@ def carregar_pedidos_empresa(data_ini, data_fim, departamentos, nome_arquivo):
         "data_final": data_fim.isoformat(),
         "departamentos": [limpar_texto(d).upper() for d in departamentos],
         "nome_arquivo": limpar_texto(nome_arquivo),
+        "demanda": limpar_texto(demanda),
     }
 
     try:
@@ -653,7 +688,19 @@ def consultar_status_pedidos_api(pedidos):
 # =========================================================
 
 
-def salvar_carga_no_neon(df_final, df_removidos, nome_carga, nome_arquivo, usuario_importacao, analista, departamento, data_ini, data_fim):
+def salvar_carga_no_neon(
+    df_final,
+    df_removidos,
+    nome_carga,
+    nome_arquivo,
+    usuario_importacao,
+    analista,
+    departamento,
+    data_ini,
+    data_fim,
+    demanda_importacao="",
+    valor_informado=None,
+):
     engine = get_engine_neon()
     if engine is None:
         st.error("Neon/PostgreSQL não configurado. Verifique os Secrets.")
@@ -663,6 +710,9 @@ def salvar_carga_no_neon(df_final, df_removidos, nome_carga, nome_arquivo, usuar
     pedidos_liberados = df_final.loc[df_final["STATUS_BANCO"] == "LIBERADO", COLUNA_PEDIDO].nunique() if not df_final.empty else 0
     qtd_liberados = int(pedidos_liberados)
     qtd_nao_liberados = max(qtd_pedidos - qtd_liberados, 0)
+    valor_total_calculado = float(df_final[COLUNA_VALOR].fillna(0).sum()) if COLUNA_VALOR in df_final.columns and not df_final.empty else 0.0
+    valor_informado_num = limpar_valor(valor_informado)
+    diferenca_valor = None if valor_informado_num is None else float(valor_total_calculado - valor_informado_num)
 
     try:
         with engine.begin() as conn:
@@ -671,10 +721,12 @@ def salvar_carga_no_neon(df_final, df_removidos, nome_carga, nome_arquivo, usuar
                     """
                     INSERT INTO cargas_importacao
                     (nome_carga, nome_arquivo, usuario_importacao, qtd_pedidos, qtd_liberados, qtd_nao_liberados,
-                     departamento, filtro_data_ini, filtro_data_fim, analista)
+                     departamento, filtro_data_ini, filtro_data_fim, analista, demanda_importacao,
+                     valor_informado, valor_total_calculado, diferenca_valor)
                     VALUES
                     (:nome_carga, :nome_arquivo, :usuario_importacao, :qtd_pedidos, :qtd_liberados, :qtd_nao_liberados,
-                     :departamento, :filtro_data_ini, :filtro_data_fim, :analista)
+                     :departamento, :filtro_data_ini, :filtro_data_fim, :analista, :demanda_importacao,
+                     :valor_informado, :valor_total_calculado, :diferenca_valor)
                     RETURNING id
                     """
                 ),
@@ -689,6 +741,10 @@ def salvar_carga_no_neon(df_final, df_removidos, nome_carga, nome_arquivo, usuar
                     "filtro_data_ini": data_ini,
                     "filtro_data_fim": data_fim,
                     "analista": analista,
+                    "demanda_importacao": demanda_importacao,
+                    "valor_informado": valor_informado_num,
+                    "valor_total_calculado": valor_total_calculado,
+                    "diferenca_valor": diferenca_valor,
                 },
             ).scalar_one()
 
@@ -857,6 +913,10 @@ def carregar_cargas_neon():
                     usuario_importacao,
                     analista,
                     departamento,
+                    demanda_importacao,
+                    valor_informado,
+                    valor_total_calculado,
+                    diferenca_valor,
                     filtro_data_ini,
                     filtro_data_fim,
                     data_importacao,
@@ -1075,20 +1135,53 @@ with aba_consulta:
         arquivos = df_arquivos[COLUNA_NOME_ARQUIVO].dropna().astype(str).drop_duplicates().tolist()
         nome_arquivo = st.selectbox("Nome do arquivo importado", options=arquivos)
 
+        st.subheader("3. Classificação antes de importar")
+        st.caption("Antes de carregar os pedidos, selecione se o arquivo é Puxada, Empurrada ou Venda Jurídica. O valor correto vem da query, somando somente ZBG_TIPO = '1'.")
+
+        col_tipo_demanda, col_valor_demanda, col_qtd_demanda = st.columns([1.2, 1, 1])
+        with col_tipo_demanda:
+            tipo_demanda_importacao = st.selectbox(
+                "Esse arquivo é de qual tipo?",
+                options=DEMANDAS,
+                format_func=lambda x: x.replace("DEMANDA ", "").title().replace("Juridica", "Jurídica"),
+            )
+
+        linha_arquivo = df_arquivos[df_arquivos[COLUNA_NOME_ARQUIVO] == nome_arquivo].iloc[0]
+        valor_informado_importacao = valor_tipo1_por_demanda(linha_arquivo, tipo_demanda_importacao)
+        qtd_tipo1_demanda = qtd_tipo1_por_demanda(linha_arquivo, tipo_demanda_importacao)
+
+        with col_valor_demanda:
+            st.metric("Valor correto da query", formatar_moeda(valor_informado_importacao))
+            st.caption("Soma de C7_TOTAL com ZBG_TIPO = '1'.")
+        with col_qtd_demanda:
+            st.metric("Pedidos tipo 1", qtd_tipo1_demanda)
+            st.caption("Quantidade de pedidos nessa demanda.")
+
         nome_carga_sugerido = (
-            f"{analista} - {departamento_carga} - {nome_arquivo} - "
+            f"{analista} - {tipo_demanda_importacao.replace('DEMANDA ', '')} - {departamento_carga} - {nome_arquivo} - "
             f"{data_ini.strftime('%d/%m/%Y')} a {data_fim.strftime('%d/%m/%Y')}"
         )
         nome_carga = st.text_input("Nome para salvar no histórico do Neon", value=nome_carga_sugerido)
 
-        if st.button("📥 Carregar pedidos desse arquivo", type="primary"):
+        if valor_informado_importacao <= 0:
+            st.warning("A query não encontrou valor tipo 1 para essa demanda neste arquivo. Verifique se o tipo selecionado está correto.")
+
+        if st.button("📥 Carregar pedidos desse arquivo", type="primary", disabled=(valor_informado_importacao <= 0)):
             with st.spinner("Carregando pedidos do arquivo selecionado pela API..."):
                 df_pedidos = carregar_pedidos_empresa(
                     data_ini,
                     data_fim,
                     departamentos_selecionados,
                     nome_arquivo,
+                    tipo_demanda_importacao,
                 )
+
+                if not df_pedidos.empty:
+                    df_pedidos[COLUNA_DEMANDA] = tipo_demanda_importacao
+                    df_pedidos["VALOR_INFORMADO_IMPORTACAO"] = float(valor_informado_importacao)
+                    df_pedidos["VALOR_REFERENCIA_TIPO1_QUERY"] = float(valor_informado_importacao)
+                    df_pedidos["TIPO_IMPORTACAO"] = tipo_demanda_importacao
+
                 st.session_state["df_pedidos_empresa"] = df_pedidos
                 st.session_state["nome_arquivo_selecionado"] = nome_arquivo
                 st.session_state["nome_carga"] = nome_carga
@@ -1097,6 +1190,8 @@ with aba_consulta:
                 st.session_state["analista"] = analista
                 st.session_state["departamentos_selecionados"] = departamentos_selecionados
                 st.session_state["departamento"] = departamento_carga
+                st.session_state["tipo_demanda_importacao"] = tipo_demanda_importacao
+                st.session_state["valor_informado_importacao"] = float(valor_informado_importacao)
 
     elif buscar:
         st.warning("Nenhum arquivo encontrado para os filtros selecionados.")
@@ -1105,8 +1200,16 @@ with aba_consulta:
     df_base = preparar_df_pedidos(df_base)
 
     if not df_base.empty:
+        tipo_demanda_importacao = st.session_state.get("tipo_demanda_importacao", "")
+        valor_informado_importacao = limpar_valor(st.session_state.get("valor_informado_importacao", 0)) or 0.0
+
+        if tipo_demanda_importacao:
+            df_base[COLUNA_DEMANDA] = tipo_demanda_importacao
+            df_base["TIPO_IMPORTACAO"] = tipo_demanda_importacao
+            df_base["VALOR_INFORMADO_IMPORTACAO"] = float(valor_informado_importacao)
+
         st.divider()
-        st.subheader("3. Remover pedidos errados desta importação")
+        st.subheader("4. Remover pedidos errados desta importação")
         st.caption("Use esse campo quando algum pedido entrou por engano. Ele será retirado desta importação, mas ficará registrado como removido quando você salvar no Neon.")
 
         filtro_fornecedor_remover = st.text_input("Filtrar fornecedor para selecionar pedido a remover")
@@ -1126,7 +1229,7 @@ with aba_consulta:
         df_final = df_base[~df_base[COLUNA_PEDIDO].isin(pedidos_remover)].copy()
 
         st.divider()
-        st.subheader("4. Pedidos encontrados")
+        st.subheader("5. Pedidos encontrados")
 
         total_linhas = len(df_final)
         total_pedidos = df_final[COLUNA_PEDIDO].nunique() if COLUNA_PEDIDO in df_final.columns else len(df_final)
@@ -1134,13 +1237,24 @@ with aba_consulta:
         total_bloqueados = df_final.loc[df_final["STATUS_BANCO"] == "BLOQUEADO", COLUNA_PEDIDO].nunique() if "STATUS_BANCO" in df_final.columns else 0
         total_valor = df_final[COLUNA_VALOR].fillna(0).sum() if COLUNA_VALOR in df_final.columns else 0
 
-        m1, m2, m3, m4, m5, m6 = st.columns(6)
+        valor_informado_importacao = limpar_valor(st.session_state.get("valor_informado_importacao", 0)) or 0.0
+        diferenca_valor = total_valor - valor_informado_importacao
+
+        m1, m2, m3, m4, m5, m6, m7, m8 = st.columns(8)
         m1.metric("Linhas", total_linhas)
         m2.metric("Pedidos únicos", total_pedidos)
         m3.metric("Liberados", int(total_liberados))
         m4.metric("Bloqueados", int(total_bloqueados))
         m5.metric("Removidos", len(pedidos_remover))
-        m6.metric("Valor total", formatar_moeda(total_valor))
+        m6.metric("Soma pedidos", formatar_moeda(total_valor))
+        m7.metric("Valor query tipo 1", formatar_moeda(valor_informado_importacao))
+        m8.metric("Diferença", formatar_moeda(diferenca_valor))
+
+        if abs(diferenca_valor) > 0.01:
+            st.warning(
+                f"A soma dos pedidos carregados ({formatar_moeda(total_valor)}) está diferente do valor da query tipo 1 "
+                f"({formatar_moeda(valor_informado_importacao)}). Diferença: {formatar_moeda(diferenca_valor)}."
+            )
 
         abas_demandas = st.tabs(["Demanda Puxada", "Demanda Empurrada", "Demanda Venda Jurídica", "Substituição"])
         tabelas_excel = {}
@@ -1265,6 +1379,8 @@ with aba_consulta:
                         departamento=st.session_state.get("departamento", ""),
                         data_ini=st.session_state.get("data_ini", data_ini),
                         data_fim=st.session_state.get("data_fim", data_fim),
+                        demanda_importacao=st.session_state.get("tipo_demanda_importacao", ""),
+                        valor_informado=st.session_state.get("valor_informado_importacao", None),
                     )
                     if sucesso:
                         st.success("Importação salva no Neon, removidos registrados e histórico de liberados atualizado.")
@@ -1334,6 +1450,8 @@ with aba_config:
     st.subheader("O que foi ajustado nesta versão")
     st.markdown(
         """
+        - Antes de carregar o arquivo, o app pergunta se a importação é **Puxada**, **Empurrada** ou **Venda Jurídica**.
+        - Antes de carregar, o app também pede o **valor total informado** e depois compara com a soma dos pedidos.
         - Após carregar o arquivo, o app pergunta se existe pedido para remover da importação.
         - A remoção tem filtro por fornecedor e seleção múltipla de pedidos.
         - Os pedidos ficam separados nas abas **Demanda Puxada**, **Demanda Empurrada** e **Demanda Venda Jurídica**.
