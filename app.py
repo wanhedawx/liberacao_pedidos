@@ -31,8 +31,18 @@ COLUNA_VALOR = "VALOR_TOTAL"
 COLUNA_DEPARTAMENTO = "DEPARTAMENTO"
 COLUNA_NOME_ARQUIVO = "NOME_ARQUIVO"
 COLUNA_DATA = "DT_EMISSAO"
+COLUNA_DEMANDA = "DEMANDA"
+COLUNA_COD_DEMANDA = "COD_DEMANDA"
 
-VALORES_STATUS_LIBERADO = {"L", "LIBERADO", "LIBERADA", "APROVADO", "APROVADA", "S", "SIM"}
+VALORES_STATUS_LIBERADO = {"L", "LIBERADO", "LIBERADA", "APROVADO", "APROVADA", "S", "SIM", "OK"}
+DEMANDAS = ["DEMANDA PUXADA", "DEMANDA EMPURRADA", "DEMANDA VENDA JURIDICA"]
+
+# Ajuste aqui se a regra da empresa for outra.
+MAPA_COD_DEMANDA = {
+    "Q": "DEMANDA PUXADA",
+    "D": "DEMANDA EMPURRADA",
+    "B": "DEMANDA VENDA JURIDICA",
+}
 
 
 # =========================================================
@@ -146,16 +156,10 @@ def normalizar_status(valor):
     if status in {"B", "BLOQUEADO", "BLOQUEADA"}:
         return "BLOQUEADO"
 
+    if status in {"NÃO ENCONTRADO", "NAO ENCONTRADO"}:
+        return "NÃO ENCONTRADO"
+
     return "NÃO LIBERADO"
-
-
-
-def gerar_excel(df):
-    output = BytesIO()
-    with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        df.to_excel(writer, index=False, sheet_name="Pedidos")
-    output.seek(0)
-    return output
 
 
 
@@ -177,6 +181,148 @@ def formatar_moeda(valor):
         return f"R$ {float(valor):,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
     except Exception:
         return "R$ 0,00"
+
+
+
+def normalizar_nome_aba(nome):
+    proibidos = ["/", "\\", "?", "*", "[", "]", ":"]
+    nome_limpo = str(nome)
+    for c in proibidos:
+        nome_limpo = nome_limpo.replace(c, "-")
+    return nome_limpo[:31] or "Aba"
+
+
+
+def gerar_excel_abas(dfs_por_aba, df_removidos=None, df_substituicoes=None):
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        escreveu = False
+        for nome_aba, df in dfs_por_aba.items():
+            if df is None or df.empty:
+                continue
+            df.to_excel(writer, index=False, sheet_name=normalizar_nome_aba(nome_aba))
+            escreveu = True
+
+        if df_removidos is not None and not df_removidos.empty:
+            df_removidos.to_excel(writer, index=False, sheet_name="Removidos")
+            escreveu = True
+
+        if df_substituicoes is not None and not df_substituicoes.empty:
+            df_substituicoes.to_excel(writer, index=False, sheet_name="Substituicoes")
+            escreveu = True
+
+        if not escreveu:
+            pd.DataFrame({"INFO": ["Sem dados"]}).to_excel(writer, index=False, sheet_name="Pedidos")
+
+    output.seek(0)
+    return output
+
+
+
+def definir_demanda(row):
+    demanda = limpar_texto(row.get(COLUNA_DEMANDA, "")).upper()
+    if demanda in DEMANDAS:
+        return demanda
+
+    cod = limpar_texto(row.get(COLUNA_COD_DEMANDA, "")).upper()
+    if cod in MAPA_COD_DEMANDA:
+        return MAPA_COD_DEMANDA[cod]
+
+    tipo = limpar_texto(row.get("TIPO", "")).upper()
+    if tipo == "TIPO_FORNECEDOR":
+        return "DEMANDA PUXADA"
+    if tipo == "TIPO_LOJA":
+        return "DEMANDA EMPURRADA"
+
+    return "OUTROS"
+
+
+
+def preparar_df_pedidos(df):
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    df = df.copy()
+    df.columns = [str(c).strip().upper() for c in df.columns]
+
+    if COLUNA_PEDIDO in df.columns:
+        df[COLUNA_PEDIDO] = df[COLUNA_PEDIDO].apply(limpar_texto)
+        df = df[df[COLUNA_PEDIDO] != ""].copy()
+
+    for coluna, padrao in [
+        (COLUNA_FORNECEDOR, ""),
+        (COLUNA_LOJA, "GERAL"),
+        (COLUNA_DEPARTAMENTO, ""),
+        (COLUNA_NOME_ARQUIVO, ""),
+        ("MOTIVO", ""),
+        ("STATUS_BANCO", "NÃO INFORMADO"),
+        ("COD_STATUS_BANCO", ""),
+        (COLUNA_VALOR, None),
+    ]:
+        if coluna not in df.columns:
+            df[coluna] = padrao
+
+    df[COLUNA_FORNECEDOR] = df[COLUNA_FORNECEDOR].apply(limpar_texto)
+    df[COLUNA_LOJA] = df[COLUNA_LOJA].apply(limpar_texto).replace("", "GERAL")
+    df[COLUNA_DEPARTAMENTO] = df[COLUNA_DEPARTAMENTO].apply(limpar_texto)
+    df[COLUNA_NOME_ARQUIVO] = df[COLUNA_NOME_ARQUIVO].apply(limpar_texto)
+    df[COLUNA_VALOR] = df[COLUNA_VALOR].apply(limpar_valor)
+    df["STATUS_BANCO"] = df["STATUS_BANCO"].apply(normalizar_status)
+    df["COD_STATUS_BANCO"] = df["COD_STATUS_BANCO"].apply(limpar_texto)
+    df["MOTIVO"] = df["MOTIVO"].apply(limpar_texto)
+    df[COLUNA_DEMANDA] = df.apply(definir_demanda, axis=1)
+
+    return df.drop_duplicates().copy()
+
+
+
+def montar_tabela_planilha(df):
+    if df is None or df.empty:
+        return pd.DataFrame(columns=["FILIAL", "FORNECEDOR", "PEDIDO", "MOTIVO", "Status"])
+
+    df = df.copy()
+    for col in [COLUNA_LOJA, COLUNA_FORNECEDOR, COLUNA_PEDIDO, "MOTIVO", "STATUS_BANCO"]:
+        if col not in df.columns:
+            df[col] = ""
+
+    def juntar_unicos(serie):
+        valores = [limpar_texto(v) for v in serie if limpar_texto(v)]
+        return "; ".join(sorted(set(valores)))
+
+    tabela = (
+        df.groupby([COLUNA_LOJA, COLUNA_FORNECEDOR, COLUNA_PEDIDO], dropna=False)
+        .agg(
+            MOTIVO=("MOTIVO", juntar_unicos),
+            Status=("STATUS_BANCO", lambda x: "LIBERADO" if "LIBERADO" in set(x) else "BLOQUEADO"),
+        )
+        .reset_index()
+    )
+
+    tabela = tabela.rename(columns={COLUNA_LOJA: "FILIAL", COLUNA_FORNECEDOR: "FORNECEDOR", COLUNA_PEDIDO: "PEDIDO"})
+    tabela = tabela[["FILIAL", "FORNECEDOR", "PEDIDO", "MOTIVO", "Status"]]
+    return tabela
+
+
+
+def montar_opcoes_pedido(df, filtro_fornecedor=""):
+    if df is None or df.empty:
+        return {}, []
+
+    base = df[[COLUNA_PEDIDO, COLUNA_FORNECEDOR, COLUNA_LOJA, "STATUS_BANCO"]].drop_duplicates().copy()
+    if filtro_fornecedor:
+        base = base[base[COLUNA_FORNECEDOR].astype(str).str.contains(filtro_fornecedor, case=False, na=False)]
+
+    base = base.sort_values([COLUNA_FORNECEDOR, COLUNA_PEDIDO])
+    mapa = {}
+    for _, row in base.iterrows():
+        pedido = limpar_texto(row[COLUNA_PEDIDO])
+        fornecedor = limpar_texto(row[COLUNA_FORNECEDOR])
+        loja = limpar_texto(row[COLUNA_LOJA])
+        status = limpar_texto(row["STATUS_BANCO"])
+        label = f"{pedido} | {fornecedor} | {loja} | {status}"
+        mapa[label] = pedido
+
+    return mapa, list(mapa.keys())
 
 
 # =========================================================
@@ -265,12 +411,56 @@ def criar_tabelas_neon():
         UNIQUE (pedido, loja)
     );
 
+    CREATE TABLE IF NOT EXISTS pedidos_removidos_importacao (
+        id BIGSERIAL PRIMARY KEY,
+        carga_id BIGINT REFERENCES cargas_importacao(id) ON DELETE CASCADE,
+        nome_carga TEXT,
+        nome_arquivo TEXT,
+        usuario_importacao TEXT,
+        pedido TEXT,
+        fornecedor TEXT,
+        loja TEXT,
+        departamento TEXT,
+        status_banco TEXT,
+        cod_status_banco TEXT,
+        motivo_remocao TEXT DEFAULT 'REMOVIDO DA IMPORTAÇÃO PELO ANALISTA',
+        dados_planilha JSONB,
+        data_remocao TIMESTAMP DEFAULT NOW()
+    );
+
+    CREATE TABLE IF NOT EXISTS substituicoes_pedidos (
+        id BIGSERIAL PRIMARY KEY,
+        nome_carga TEXT,
+        nome_arquivo TEXT,
+        usuario_registro TEXT,
+        analista TEXT,
+        departamento TEXT,
+        pedido_antigo TEXT NOT NULL,
+        fornecedor_antigo TEXT,
+        loja_antiga TEXT,
+        status_antigo TEXT,
+        cod_status_antigo TEXT,
+        pedido_novo TEXT NOT NULL,
+        fornecedor_novo TEXT,
+        loja_nova TEXT,
+        status_novo TEXT,
+        cod_status_novo TEXT,
+        motivo TEXT NOT NULL,
+        observacao TEXT,
+        dados_pedido_antigo JSONB,
+        dados_pedido_novo JSONB,
+        data_registro TIMESTAMP DEFAULT NOW()
+    );
+
     ALTER TABLE cargas_importacao ADD COLUMN IF NOT EXISTS departamento TEXT;
     ALTER TABLE cargas_importacao ADD COLUMN IF NOT EXISTS filtro_data_ini DATE;
     ALTER TABLE cargas_importacao ADD COLUMN IF NOT EXISTS filtro_data_fim DATE;
+    ALTER TABLE cargas_importacao ADD COLUMN IF NOT EXISTS analista TEXT;
     ALTER TABLE pedidos_importados ADD COLUMN IF NOT EXISTS departamento TEXT;
     ALTER TABLE pedidos_importados ADD COLUMN IF NOT EXISTS nome_arquivo_origem TEXT;
+    ALTER TABLE pedidos_importados ADD COLUMN IF NOT EXISTS demanda TEXT;
     ALTER TABLE pedidos_liberados_historico ADD COLUMN IF NOT EXISTS departamento TEXT;
+    ALTER TABLE pedidos_liberados_historico ADD COLUMN IF NOT EXISTS demanda TEXT;
     """
 
     try:
@@ -428,49 +618,34 @@ def carregar_pedidos_empresa(data_ini, data_fim, departamentos, nome_arquivo):
         retorno = chamar_api("POST", "/pedidos", payload=payload)
         dados = retorno.get("dados", []) if isinstance(retorno, dict) else []
         df = pd.DataFrame(dados)
-        df.columns = [str(c).strip().upper() for c in df.columns]
     except Exception as e:
         st.error("Erro ao buscar pedidos na API da empresa.")
         st.code(str(e))
         return pd.DataFrame()
 
-    if df.empty:
-        return df
+    return preparar_df_pedidos(df)
 
-    if COLUNA_PEDIDO not in df.columns:
-        st.error("A API precisa retornar a coluna PEDIDO.")
+
+
+def consultar_status_pedidos_api(pedidos):
+    pedidos_limpos = [limpar_texto(p) for p in pedidos if limpar_texto(p)]
+    if not pedidos_limpos:
         return pd.DataFrame()
 
-    df[COLUNA_PEDIDO] = df[COLUNA_PEDIDO].apply(limpar_texto)
-    df = df[df[COLUNA_PEDIDO] != ""].copy()
-
-    # Padronizações para o Neon e métricas.
-    if COLUNA_FORNECEDOR not in df.columns:
-        df[COLUNA_FORNECEDOR] = ""
-    if COLUNA_LOJA not in df.columns:
-        df[COLUNA_LOJA] = "GERAL"
-    if COLUNA_VALOR not in df.columns:
-        df[COLUNA_VALOR] = None
-    if COLUNA_DEPARTAMENTO not in df.columns:
-        df[COLUNA_DEPARTAMENTO] = ""
-    if COLUNA_NOME_ARQUIVO not in df.columns:
-        df[COLUNA_NOME_ARQUIVO] = nome_arquivo
-    if "STATUS_BANCO" not in df.columns:
-        df["STATUS_BANCO"] = df.get("COD_STATUS_BANCO", "").apply(normalizar_status)
-    if "COD_STATUS_BANCO" not in df.columns:
-        df["COD_STATUS_BANCO"] = df["STATUS_BANCO"]
-
-    df[COLUNA_FORNECEDOR] = df[COLUNA_FORNECEDOR].apply(limpar_texto)
-    df[COLUNA_LOJA] = df[COLUNA_LOJA].apply(limpar_texto).replace("", "GERAL")
-    df[COLUNA_VALOR] = df[COLUNA_VALOR].apply(limpar_valor)
-    df[COLUNA_DEPARTAMENTO] = df[COLUNA_DEPARTAMENTO].apply(limpar_texto)
-    df[COLUNA_NOME_ARQUIVO] = df[COLUNA_NOME_ARQUIVO].apply(limpar_texto)
-    df["STATUS_BANCO"] = df["STATUS_BANCO"].apply(normalizar_status)
-    df["COD_STATUS_BANCO"] = df["COD_STATUS_BANCO"].apply(limpar_texto)
-
-    # Remove apenas linhas 100% repetidas, sem perder produtos diferentes do mesmo pedido.
-    df = df.drop_duplicates().copy()
-    return df
+    payload = {"pedidos": pedidos_limpos}
+    try:
+        retorno = chamar_api("POST", "/status-pedidos", payload=payload, timeout=120)
+        dados = retorno.get("dados", []) if isinstance(retorno, dict) else []
+        df = pd.DataFrame(dados)
+        if not df.empty:
+            df.columns = [str(c).strip().upper() for c in df.columns]
+            if "STATUS_BANCO" in df.columns:
+                df["STATUS_BANCO"] = df["STATUS_BANCO"].apply(normalizar_status)
+        return df
+    except Exception as e:
+        st.error("Erro ao consultar status do pedido na API.")
+        st.code(str(e))
+        return pd.DataFrame()
 
 
 # =========================================================
@@ -478,14 +653,14 @@ def carregar_pedidos_empresa(data_ini, data_fim, departamentos, nome_arquivo):
 # =========================================================
 
 
-def salvar_carga_no_neon(df_final, nome_carga, nome_arquivo, usuario_importacao, departamento, data_ini, data_fim):
+def salvar_carga_no_neon(df_final, df_removidos, nome_carga, nome_arquivo, usuario_importacao, analista, departamento, data_ini, data_fim):
     engine = get_engine_neon()
     if engine is None:
         st.error("Neon/PostgreSQL não configurado. Verifique os Secrets.")
         return False
 
     qtd_pedidos = int(df_final[COLUNA_PEDIDO].nunique()) if COLUNA_PEDIDO in df_final.columns else len(df_final)
-    pedidos_liberados = df_final.loc[df_final["STATUS_BANCO"] == "LIBERADO", COLUNA_PEDIDO].nunique()
+    pedidos_liberados = df_final.loc[df_final["STATUS_BANCO"] == "LIBERADO", COLUNA_PEDIDO].nunique() if not df_final.empty else 0
     qtd_liberados = int(pedidos_liberados)
     qtd_nao_liberados = max(qtd_pedidos - qtd_liberados, 0)
 
@@ -496,10 +671,10 @@ def salvar_carga_no_neon(df_final, nome_carga, nome_arquivo, usuario_importacao,
                     """
                     INSERT INTO cargas_importacao
                     (nome_carga, nome_arquivo, usuario_importacao, qtd_pedidos, qtd_liberados, qtd_nao_liberados,
-                     departamento, filtro_data_ini, filtro_data_fim)
+                     departamento, filtro_data_ini, filtro_data_fim, analista)
                     VALUES
                     (:nome_carga, :nome_arquivo, :usuario_importacao, :qtd_pedidos, :qtd_liberados, :qtd_nao_liberados,
-                     :departamento, :filtro_data_ini, :filtro_data_fim)
+                     :departamento, :filtro_data_ini, :filtro_data_fim, :analista)
                     RETURNING id
                     """
                 ),
@@ -513,6 +688,7 @@ def salvar_carga_no_neon(df_final, nome_carga, nome_arquivo, usuario_importacao,
                     "departamento": departamento,
                     "filtro_data_ini": data_ini,
                     "filtro_data_fim": data_fim,
+                    "analista": analista,
                 },
             ).scalar_one()
 
@@ -525,6 +701,7 @@ def salvar_carga_no_neon(df_final, nome_carga, nome_arquivo, usuario_importacao,
                 nome_arq_row = limpar_texto(row.get(COLUNA_NOME_ARQUIVO)) or nome_arquivo
                 status_banco = limpar_texto(row.get("STATUS_BANCO"))
                 cod_status_banco = limpar_texto(row.get("COD_STATUS_BANCO"))
+                demanda = limpar_texto(row.get(COLUNA_DEMANDA))
                 dados = row_json(row)
 
                 conn.execute(
@@ -532,10 +709,10 @@ def salvar_carga_no_neon(df_final, nome_carga, nome_arquivo, usuario_importacao,
                         """
                         INSERT INTO pedidos_importados
                         (carga_id, pedido, fornecedor, loja, valor, status_banco, cod_status_banco,
-                         dados_planilha, departamento, nome_arquivo_origem)
+                         dados_planilha, departamento, nome_arquivo_origem, demanda)
                         VALUES
                         (:carga_id, :pedido, :fornecedor, :loja, :valor, :status_banco, :cod_status_banco,
-                         CAST(:dados_planilha AS JSONB), :departamento, :nome_arquivo_origem)
+                         CAST(:dados_planilha AS JSONB), :departamento, :nome_arquivo_origem, :demanda)
                         """
                     ),
                     {
@@ -549,6 +726,7 @@ def salvar_carga_no_neon(df_final, nome_carga, nome_arquivo, usuario_importacao,
                         "dados_planilha": dados,
                         "departamento": depto_row,
                         "nome_arquivo_origem": nome_arq_row,
+                        "demanda": demanda,
                     },
                 )
 
@@ -558,10 +736,10 @@ def salvar_carga_no_neon(df_final, nome_carga, nome_arquivo, usuario_importacao,
                             """
                             INSERT INTO pedidos_liberados_historico
                             (pedido, fornecedor, loja, valor, status_banco, cod_status_banco,
-                             primeira_carga, ultima_carga, dados_ultima_planilha, departamento)
+                             primeira_carga, ultima_carga, dados_ultima_planilha, departamento, demanda)
                             VALUES
                             (:pedido, :fornecedor, :loja, :valor, :status_banco, :cod_status_banco,
-                             :nome_carga, :nome_carga, CAST(:dados_planilha AS JSONB), :departamento)
+                             :nome_carga, :nome_carga, CAST(:dados_planilha AS JSONB), :departamento, :demanda)
                             ON CONFLICT (pedido, loja)
                             DO UPDATE SET
                                 fornecedor = EXCLUDED.fornecedor,
@@ -571,7 +749,8 @@ def salvar_carga_no_neon(df_final, nome_carga, nome_arquivo, usuario_importacao,
                                 ultima_carga = EXCLUDED.ultima_carga,
                                 ultima_atualizacao = NOW(),
                                 dados_ultima_planilha = EXCLUDED.dados_ultima_planilha,
-                                departamento = EXCLUDED.departamento
+                                departamento = EXCLUDED.departamento,
+                                demanda = EXCLUDED.demanda
                             """
                         ),
                         {
@@ -584,6 +763,35 @@ def salvar_carga_no_neon(df_final, nome_carga, nome_arquivo, usuario_importacao,
                             "nome_carga": nome_carga,
                             "dados_planilha": dados,
                             "departamento": depto_row,
+                            "demanda": demanda,
+                        },
+                    )
+
+            if df_removidos is not None and not df_removidos.empty:
+                for _, row in df_removidos.iterrows():
+                    conn.execute(
+                        text(
+                            """
+                            INSERT INTO pedidos_removidos_importacao
+                            (carga_id, nome_carga, nome_arquivo, usuario_importacao, pedido, fornecedor, loja,
+                             departamento, status_banco, cod_status_banco, dados_planilha)
+                            VALUES
+                            (:carga_id, :nome_carga, :nome_arquivo, :usuario_importacao, :pedido, :fornecedor, :loja,
+                             :departamento, :status_banco, :cod_status_banco, CAST(:dados_planilha AS JSONB))
+                            """
+                        ),
+                        {
+                            "carga_id": carga_id,
+                            "nome_carga": nome_carga,
+                            "nome_arquivo": nome_arquivo,
+                            "usuario_importacao": usuario_importacao,
+                            "pedido": limpar_texto(row.get(COLUNA_PEDIDO)),
+                            "fornecedor": limpar_texto(row.get(COLUNA_FORNECEDOR)),
+                            "loja": limpar_texto(row.get(COLUNA_LOJA)) or "GERAL",
+                            "departamento": limpar_texto(row.get(COLUNA_DEPARTAMENTO)) or departamento,
+                            "status_banco": limpar_texto(row.get("STATUS_BANCO")),
+                            "cod_status_banco": limpar_texto(row.get("COD_STATUS_BANCO")),
+                            "dados_planilha": row_json(row),
                         },
                     )
 
@@ -591,6 +799,39 @@ def salvar_carga_no_neon(df_final, nome_carga, nome_arquivo, usuario_importacao,
 
     except Exception as e:
         st.error("Erro ao salvar no Neon/PostgreSQL.")
+        st.code(str(e))
+        return False
+
+
+
+def salvar_substituicao_neon(dados):
+    engine = get_engine_neon()
+    if engine is None:
+        st.error("Neon/PostgreSQL não configurado. Verifique os Secrets.")
+        return False
+
+    try:
+        with engine.begin() as conn:
+            conn.execute(
+                text(
+                    """
+                    INSERT INTO substituicoes_pedidos
+                    (nome_carga, nome_arquivo, usuario_registro, analista, departamento,
+                     pedido_antigo, fornecedor_antigo, loja_antiga, status_antigo, cod_status_antigo,
+                     pedido_novo, fornecedor_novo, loja_nova, status_novo, cod_status_novo,
+                     motivo, observacao, dados_pedido_antigo, dados_pedido_novo)
+                    VALUES
+                    (:nome_carga, :nome_arquivo, :usuario_registro, :analista, :departamento,
+                     :pedido_antigo, :fornecedor_antigo, :loja_antiga, :status_antigo, :cod_status_antigo,
+                     :pedido_novo, :fornecedor_novo, :loja_nova, :status_novo, :cod_status_novo,
+                     :motivo, :observacao, CAST(:dados_pedido_antigo AS JSONB), CAST(:dados_pedido_novo AS JSONB))
+                    """
+                ),
+                dados,
+            )
+        return True
+    except Exception as e:
+        st.error("Erro ao salvar substituição no Neon.")
         st.code(str(e))
         return False
 
@@ -614,6 +855,7 @@ def carregar_cargas_neon():
                     nome_carga,
                     nome_arquivo,
                     usuario_importacao,
+                    analista,
                     departamento,
                     filtro_data_ini,
                     filtro_data_fim,
@@ -645,6 +887,7 @@ def carregar_historico_liberados_neon():
                     fornecedor,
                     loja,
                     departamento,
+                    demanda,
                     valor,
                     status_banco,
                     cod_status_banco,
@@ -661,13 +904,81 @@ def carregar_historico_liberados_neon():
         return pd.DataFrame()
 
 
+
+def carregar_historico_substituicoes_neon(nome_arquivo=None):
+    engine = get_engine_neon()
+    if engine is None:
+        return pd.DataFrame()
+
+    try:
+        with engine.begin() as conn:
+            if nome_arquivo:
+                return pd.read_sql(
+                    text(
+                        """
+                        SELECT
+                            data_registro,
+                            usuario_registro,
+                            analista,
+                            departamento,
+                            nome_arquivo,
+                            pedido_antigo,
+                            fornecedor_antigo,
+                            loja_antiga,
+                            status_antigo,
+                            cod_status_antigo,
+                            pedido_novo,
+                            fornecedor_novo,
+                            loja_nova,
+                            status_novo,
+                            cod_status_novo,
+                            motivo,
+                            observacao
+                        FROM substituicoes_pedidos
+                        WHERE nome_arquivo = :nome_arquivo
+                        ORDER BY data_registro DESC
+                        """
+                    ),
+                    conn,
+                    params={"nome_arquivo": nome_arquivo},
+                )
+
+            return pd.read_sql(
+                """
+                SELECT
+                    data_registro,
+                    usuario_registro,
+                    analista,
+                    departamento,
+                    nome_arquivo,
+                    pedido_antigo,
+                    fornecedor_antigo,
+                    loja_antiga,
+                    status_antigo,
+                    cod_status_antigo,
+                    pedido_novo,
+                    fornecedor_novo,
+                    loja_nova,
+                    status_novo,
+                    cod_status_novo,
+                    motivo,
+                    observacao
+                FROM substituicoes_pedidos
+                ORDER BY data_registro DESC
+                """,
+                conn,
+            )
+    except Exception:
+        return pd.DataFrame()
+
+
 # =========================================================
 # APP
 # =========================================================
 
 st.markdown('<div class="titulo-principal">📦 Liberação de Pedidos</div>', unsafe_allow_html=True)
 st.markdown(
-    '<div class="subtitulo">Consulta via API FastAPI por data, analista, múltiplos departamentos e nome do arquivo importado. Depois salva o histórico no Neon/PostgreSQL.</div>',
+    '<div class="subtitulo">Consulta via API FastAPI, permite remover pedidos errados, separar por demanda e manter histórico de substituições no Neon/PostgreSQL.</div>',
     unsafe_allow_html=True,
 )
 
@@ -752,6 +1063,8 @@ with aba_consulta:
                 "departamentos": departamentos_selecionados,
                 "departamento": departamento_carga,
             }
+            st.session_state.pop("df_pedidos_empresa", None)
+            st.session_state.pop("pedidos_remover_labels", None)
 
     df_arquivos = st.session_state.get("df_arquivos_empresa", pd.DataFrame())
 
@@ -788,11 +1101,32 @@ with aba_consulta:
     elif buscar:
         st.warning("Nenhum arquivo encontrado para os filtros selecionados.")
 
-    df_final = st.session_state.get("df_pedidos_empresa", pd.DataFrame())
+    df_base = st.session_state.get("df_pedidos_empresa", pd.DataFrame())
+    df_base = preparar_df_pedidos(df_base)
 
-    if not df_final.empty:
+    if not df_base.empty:
         st.divider()
-        st.subheader("3. Pedidos encontrados")
+        st.subheader("3. Remover pedidos errados desta importação")
+        st.caption("Use esse campo quando algum pedido entrou por engano. Ele será retirado desta importação, mas ficará registrado como removido quando você salvar no Neon.")
+
+        filtro_fornecedor_remover = st.text_input("Filtrar fornecedor para selecionar pedido a remover")
+        mapa_remover, opcoes_remover = montar_opcoes_pedido(df_base, filtro_fornecedor_remover)
+        labels_remover = st.multiselect(
+            "Tem algum pedido que deseja remover desta importação?",
+            options=opcoes_remover,
+            default=[],
+            key="pedidos_remover_labels",
+        )
+        pedidos_remover = sorted({mapa_remover[label] for label in labels_remover if label in mapa_remover})
+
+        if pedidos_remover:
+            st.warning(f"{len(pedidos_remover)} pedido(s) selecionado(s) para remover desta importação: {', '.join(pedidos_remover)}")
+
+        df_removidos = df_base[df_base[COLUNA_PEDIDO].isin(pedidos_remover)].copy()
+        df_final = df_base[~df_base[COLUNA_PEDIDO].isin(pedidos_remover)].copy()
+
+        st.divider()
+        st.subheader("4. Pedidos encontrados")
 
         total_linhas = len(df_final)
         total_pedidos = df_final[COLUNA_PEDIDO].nunique() if COLUNA_PEDIDO in df_final.columns else len(df_final)
@@ -800,42 +1134,140 @@ with aba_consulta:
         total_bloqueados = df_final.loc[df_final["STATUS_BANCO"] == "BLOQUEADO", COLUNA_PEDIDO].nunique() if "STATUS_BANCO" in df_final.columns else 0
         total_valor = df_final[COLUNA_VALOR].fillna(0).sum() if COLUNA_VALOR in df_final.columns else 0
 
-        m1, m2, m3, m4, m5 = st.columns(5)
+        m1, m2, m3, m4, m5, m6 = st.columns(6)
         m1.metric("Linhas", total_linhas)
         m2.metric("Pedidos únicos", total_pedidos)
         m3.metric("Liberados", int(total_liberados))
         m4.metric("Bloqueados", int(total_bloqueados))
-        m5.metric("Valor total", formatar_moeda(total_valor))
+        m5.metric("Removidos", len(pedidos_remover))
+        m6.metric("Valor total", formatar_moeda(total_valor))
 
-        st.dataframe(df_final, use_container_width=True, hide_index=True)
+        abas_demandas = st.tabs(["Demanda Puxada", "Demanda Empurrada", "Demanda Venda Jurídica", "Substituição"])
+        tabelas_excel = {}
 
+        for demanda_nome, aba in zip(DEMANDAS, abas_demandas[:3]):
+            with aba:
+                df_demanda = df_final[df_final[COLUNA_DEMANDA] == demanda_nome].copy()
+                tabela_planilha = montar_tabela_planilha(df_demanda)
+                tabelas_excel[demanda_nome] = tabela_planilha
+
+                st.markdown(f"### {demanda_nome.title()}")
+                if tabela_planilha.empty:
+                    st.info("Nenhum pedido nesta demanda para os filtros selecionados.")
+                else:
+                    st.dataframe(tabela_planilha, use_container_width=True, hide_index=True)
+                    with st.expander("Ver detalhes dos produtos"):
+                        st.dataframe(df_demanda, use_container_width=True, hide_index=True)
+
+        with abas_demandas[3]:
+            st.markdown("### Substituição de pedido")
+            st.caption("Registre aqui quando um pedido precisou ser refeito. O histórico guarda o pedido antigo e o novo, mesmo que o pedido seja refeito várias vezes.")
+
+            filtro_fornecedor_sub = st.text_input("Filtrar fornecedor para escolher o pedido antigo", key="filtro_fornecedor_sub")
+            mapa_sub, opcoes_sub = montar_opcoes_pedido(df_final, filtro_fornecedor_sub)
+
+            if not opcoes_sub:
+                st.info("Nenhum pedido disponível para substituição com esse filtro.")
+            else:
+                label_pedido_antigo = st.selectbox("Qual pedido você precisa substituir?", options=opcoes_sub)
+                pedido_antigo = mapa_sub.get(label_pedido_antigo, "")
+
+                col_sub1, col_sub2 = st.columns([1, 1])
+                with col_sub1:
+                    pedido_novo = st.text_input("Novo pedido", placeholder="Digite o novo número do pedido")
+                with col_sub2:
+                    motivo_sub = st.selectbox("Motivo fixo", options=["ERRO DE CADASTRO", "ERRO DE TABELA"])
+
+                observacao_sub = st.text_area("OBS escrita", placeholder="Digite a observação da substituição")
+
+                df_status_novo = pd.DataFrame()
+                if pedido_novo and st.button("🔎 Consultar status do novo pedido"):
+                    df_status_novo = consultar_status_pedidos_api([pedido_novo])
+                    st.session_state["df_status_pedido_novo"] = df_status_novo
+
+                df_status_novo = st.session_state.get("df_status_pedido_novo", pd.DataFrame())
+                if pedido_novo and not df_status_novo.empty:
+                    st.write("Status do pedido novo:")
+                    st.dataframe(df_status_novo, use_container_width=True, hide_index=True)
+
+                if st.button("💾 Salvar substituição no Neon", type="primary"):
+                    if not ok_neon:
+                        st.error("Neon não conectado. Verifique os Secrets.")
+                    elif not pedido_novo:
+                        st.error("Informe o novo pedido.")
+                    elif not pedido_antigo:
+                        st.error("Selecione o pedido antigo.")
+                    else:
+                        df_antigo = df_final[df_final[COLUNA_PEDIDO] == pedido_antigo].copy()
+                        row_antigo = df_antigo.iloc[0] if not df_antigo.empty else pd.Series(dtype="object")
+
+                        df_status_novo = consultar_status_pedidos_api([pedido_novo])
+                        row_novo = df_status_novo.iloc[0] if not df_status_novo.empty else pd.Series(dtype="object")
+
+                        dados_salvar = {
+                            "nome_carga": st.session_state.get("nome_carga", ""),
+                            "nome_arquivo": st.session_state.get("nome_arquivo_selecionado", ""),
+                            "usuario_registro": usuario_importacao,
+                            "analista": st.session_state.get("analista", analista),
+                            "departamento": st.session_state.get("departamento", departamento_carga),
+                            "pedido_antigo": pedido_antigo,
+                            "fornecedor_antigo": limpar_texto(row_antigo.get(COLUNA_FORNECEDOR, "")),
+                            "loja_antiga": limpar_texto(row_antigo.get(COLUNA_LOJA, "")),
+                            "status_antigo": limpar_texto(row_antigo.get("STATUS_BANCO", "")),
+                            "cod_status_antigo": limpar_texto(row_antigo.get("COD_STATUS_BANCO", "")),
+                            "pedido_novo": limpar_texto(pedido_novo),
+                            "fornecedor_novo": limpar_texto(row_novo.get("FORNECEDOR", "")),
+                            "loja_nova": limpar_texto(row_novo.get("FILIAL", "")),
+                            "status_novo": limpar_texto(row_novo.get("STATUS_BANCO", "NÃO ENCONTRADO")),
+                            "cod_status_novo": limpar_texto(row_novo.get("COD_STATUS_BANCO", "")),
+                            "motivo": motivo_sub,
+                            "observacao": observacao_sub,
+                            "dados_pedido_antigo": row_json(row_antigo) if not row_antigo.empty else "{}",
+                            "dados_pedido_novo": row_json(row_novo) if not row_novo.empty else "{}",
+                        }
+
+                        if salvar_substituicao_neon(dados_salvar):
+                            st.success("Substituição salva no histórico do Neon.")
+
+            st.divider()
+            st.subheader("Histórico de substituições deste arquivo")
+            df_subs_arquivo = carregar_historico_substituicoes_neon(st.session_state.get("nome_arquivo_selecionado", "")) if ok_neon else pd.DataFrame()
+            if df_subs_arquivo.empty:
+                st.info("Nenhuma substituição registrada para este arquivo ainda.")
+            else:
+                st.dataframe(df_subs_arquivo, use_container_width=True, hide_index=True)
+
+        st.divider()
         col_baixar, col_salvar = st.columns([1, 1])
 
         with col_baixar:
-            excel = gerar_excel(df_final)
+            df_subs_arquivo = carregar_historico_substituicoes_neon(st.session_state.get("nome_arquivo_selecionado", "")) if ok_neon else pd.DataFrame()
+            excel = gerar_excel_abas(tabelas_excel, df_removidos=df_removidos, df_substituicoes=df_subs_arquivo)
             st.download_button(
-                "📥 Baixar Excel final",
+                "📥 Baixar Excel com abas",
                 data=excel,
                 file_name=f"{st.session_state.get('nome_carga', 'pedidos')}.xlsx".replace("/", "-"),
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             )
 
         with col_salvar:
-            if st.button("💾 Salvar no Neon", type="primary", use_container_width=True):
+            if st.button("💾 Salvar importação no Neon", type="primary", use_container_width=True):
                 if not ok_neon:
                     st.error("Neon não conectado. Verifique os Secrets.")
                 else:
                     sucesso = salvar_carga_no_neon(
                         df_final=df_final,
+                        df_removidos=df_removidos,
                         nome_carga=st.session_state.get("nome_carga", "Carga sem nome"),
                         nome_arquivo=st.session_state.get("nome_arquivo_selecionado", ""),
                         usuario_importacao=usuario_importacao or st.session_state.get("analista", ""),
+                        analista=st.session_state.get("analista", analista),
                         departamento=st.session_state.get("departamento", ""),
                         data_ini=st.session_state.get("data_ini", data_ini),
                         data_fim=st.session_state.get("data_fim", data_fim),
                     )
                     if sucesso:
-                        st.success("Pedidos salvos no Neon e histórico de liberados atualizado.")
+                        st.success("Importação salva no Neon, removidos registrados e histórico de liberados atualizado.")
 
 
 with aba_historico:
@@ -874,7 +1306,7 @@ with aba_historico:
                 df_view = df_view[df_view["loja"].astype(str).str.contains(filtro_loja, case=False, na=False)]
 
             st.dataframe(df_view, use_container_width=True, hide_index=True)
-            excel_hist = gerar_excel(df_view)
+            excel_hist = gerar_excel_abas({"Historico Liberados": df_view})
             st.download_button(
                 "📥 Baixar histórico de liberados",
                 data=excel_hist,
@@ -882,17 +1314,33 @@ with aba_historico:
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             )
 
+        st.divider()
+        st.subheader("Histórico geral de substituições")
+        df_subs = carregar_historico_substituicoes_neon()
+        if df_subs.empty:
+            st.info("Nenhuma substituição registrada ainda.")
+        else:
+            st.dataframe(df_subs, use_container_width=True, hide_index=True)
+            excel_subs = gerar_excel_abas({"Substituicoes": df_subs})
+            st.download_button(
+                "📥 Baixar histórico de substituições",
+                data=excel_subs,
+                file_name="historico_substituicoes_pedidos.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+
 
 with aba_config:
-    st.subheader("O que foi ajustado")
+    st.subheader("O que foi ajustado nesta versão")
     st.markdown(
         """
-        - O Streamlit agora consulta o banco da empresa por meio da **API FastAPI**.
-        - O Streamlit não conecta mais direto no Oracle.
-        - O campo **Departamento** é **multiselect**.
-        - Os departamentos do analista já vêm **pré-selecionados**.
-        - O usuário pode marcar/remover qualquer outro departamento.
-        - O histórico continua sendo salvo no **Neon/PostgreSQL**.
+        - Após carregar o arquivo, o app pergunta se existe pedido para remover da importação.
+        - A remoção tem filtro por fornecedor e seleção múltipla de pedidos.
+        - Os pedidos ficam separados nas abas **Demanda Puxada**, **Demanda Empurrada** e **Demanda Venda Jurídica**.
+        - Existe uma aba de **Substituição**, com pedido antigo, pedido novo, motivo fixo e OBS escrita.
+        - O histórico de substituições mantém pedido antigo e novo, mesmo que seja refeito várias vezes.
+        - O status do pedido novo vem da API: `L = LIBERADO`, `B = BLOQUEADO`.
+        - O Streamlit continua salvando histórico no **Neon/PostgreSQL**.
         """
     )
 
@@ -921,5 +1369,5 @@ requests
     )
 
     st.warning(
-        "Para testar localmente, deixe a API FastAPI rodando em outro terminal. Para usar no Streamlit Cloud, a API precisa estar publicada em uma URL acessível pelo Cloud."
+        "Para testar localmente, deixe a API FastAPI rodando em outro terminal. Para a equipe usar na rede, rode o Streamlit com --server.address 0.0.0.0."
     )
