@@ -32,29 +32,15 @@ COLUNA_DEPARTAMENTO = "DEPARTAMENTO"
 COLUNA_NOME_ARQUIVO = "NOME_ARQUIVO"
 COLUNA_DATA = "DT_EMISSAO"
 COLUNA_DEMANDA = "DEMANDA"
-COLUNA_COD_DEMANDA = "COD_DEMANDA"
+COLUNA_COD_TIPO_PEDIDO_TOTVS = "COD_TIPO_PEDIDO_TOTVS"
 
 VALORES_STATUS_LIBERADO = {"L", "LIBERADO", "LIBERADA", "APROVADO", "APROVADA", "S", "SIM", "OK"}
 DEMANDAS = ["DEMANDA PUXADA", "DEMANDA EMPURRADA", "DEMANDA VENDA JURIDICA"]
 
-# Ajuste aqui se a regra da empresa for outra.
-MAPA_COD_DEMANDA = {
-    "Q": "DEMANDA PUXADA",
-    "D": "DEMANDA EMPURRADA",
-    "B": "DEMANDA VENDA JURIDICA",
-}
-
-COLUNA_VALOR_TIPO2_TOTAL = "VALOR_TIPO2_TOTAL"
-COLUNAS_VALOR_TIPO2_DEMANDA = {
-    "DEMANDA PUXADA": "VALOR_PUXADA_TIPO2",
-    "DEMANDA EMPURRADA": "VALOR_EMPURRADA_TIPO2",
-    "DEMANDA VENDA JURIDICA": "VALOR_VENDA_JURIDICA_TIPO2",
-}
-COLUNAS_QTD_TIPO2_DEMANDA = {
-    "DEMANDA PUXADA": "QTD_PUXADA_TIPO2",
-    "DEMANDA EMPURRADA": "QTD_EMPURRADA_TIPO2",
-    "DEMANDA VENDA JURIDICA": "QTD_VENDA_JURIDICA_TIPO2",
-}
+# A escolha Puxada/Empurrada/Venda Jurídica é classificação manual do analista.
+# C7_XTPPED não é usado para filtrar essa classificação.
+COLUNA_VALOR_LOJA_NAOMISTO_TOTAL = "VALOR_LOJA_NAOMISTO_TOTAL"
+COLUNA_QTD_LOJA_NAOMISTO = "QTD_PEDIDOS_LOJA_NAOMISTO"
 
 
 # =========================================================
@@ -195,23 +181,22 @@ def formatar_moeda(valor):
         return "R$ 0,00"
 
 
-def valor_tipo2_por_demanda(linha_arquivo, demanda):
-    """Retorna a soma correta da importação: tipo loja (ZBG_TIPO = '2') + pedidos NÃO MISTO, por demanda selecionada."""
-    coluna = COLUNAS_VALOR_TIPO2_DEMANDA.get(demanda)
-    if not coluna or coluna not in linha_arquivo.index:
-        return 0.0
-    return limpar_valor(linha_arquivo.get(coluna)) or 0.0
+def valor_loja_naomisto_total(linha_arquivo):
+    """Retorna a soma correta da importação: tipo loja (ZBG_TIPO = '2') + pedidos NÃO MISTO, sem filtrar por C7_XTPPED."""
+    for coluna in [COLUNA_VALOR_LOJA_NAOMISTO_TOTAL, "VALOR_TIPO2_TOTAL"]:
+        if coluna in linha_arquivo.index:
+            return limpar_valor(linha_arquivo.get(coluna)) or 0.0
+    return 0.0
 
 
-def qtd_tipo2_por_demanda(linha_arquivo, demanda):
-    coluna = COLUNAS_QTD_TIPO2_DEMANDA.get(demanda)
-    if not coluna or coluna not in linha_arquivo.index:
-        return 0
-    try:
-        return int(float(linha_arquivo.get(coluna) or 0))
-    except Exception:
-        return 0
-
+def qtd_loja_naomisto_total(linha_arquivo):
+    for coluna in [COLUNA_QTD_LOJA_NAOMISTO, "QTD_PEDIDOS_TIPO2"]:
+        if coluna in linha_arquivo.index:
+            try:
+                return int(float(linha_arquivo.get(coluna) or 0))
+            except Exception:
+                return 0
+    return 0
 
 
 def normalizar_nome_aba(nome):
@@ -250,22 +235,11 @@ def gerar_excel_abas(dfs_por_aba, df_removidos=None, df_substituicoes=None):
 
 
 def definir_demanda(row):
+    """A demanda é definida manualmente no Streamlit antes da importação."""
     demanda = limpar_texto(row.get(COLUNA_DEMANDA, "")).upper()
     if demanda in DEMANDAS:
         return demanda
-
-    cod = limpar_texto(row.get(COLUNA_COD_DEMANDA, "")).upper()
-    if cod in MAPA_COD_DEMANDA:
-        return MAPA_COD_DEMANDA[cod]
-
-    tipo = limpar_texto(row.get("TIPO", "")).upper()
-    if tipo == "TIPO_FORNECEDOR":
-        return "DEMANDA PUXADA"
-    if tipo == "TIPO_LOJA":
-        return "DEMANDA EMPURRADA"
-
     return "OUTROS"
-
 
 
 def preparar_df_pedidos(df):
@@ -637,7 +611,7 @@ def carregar_arquivos_empresa(data_ini, data_fim, departamentos):
 
 
 
-def carregar_pedidos_empresa(data_ini, data_fim, departamentos, nome_arquivo, demanda):
+def carregar_pedidos_empresa(data_ini, data_fim, departamentos, nome_arquivo):
     if not departamentos or not nome_arquivo:
         return pd.DataFrame()
 
@@ -646,7 +620,6 @@ def carregar_pedidos_empresa(data_ini, data_fim, departamentos, nome_arquivo, de
         "data_final": data_fim.isoformat(),
         "departamentos": [limpar_texto(d).upper() for d in departamentos],
         "nome_arquivo": limpar_texto(nome_arquivo),
-        "demanda": limpar_texto(demanda),
     }
 
     try:
@@ -1038,7 +1011,7 @@ def carregar_historico_substituicoes_neon(nome_arquivo=None):
 
 st.markdown('<div class="titulo-principal">📦 Liberação de Pedidos</div>', unsafe_allow_html=True)
 st.markdown(
-    '<div class="subtitulo">Consulta via API FastAPI, permite remover pedidos errados, separar por demanda e manter histórico de substituições no Neon/PostgreSQL.</div>',
+    '<div class="subtitulo">Consulta via API FastAPI, permite remover pedidos errados, classificar por demanda e manter histórico de substituições no Neon/PostgreSQL.</div>',
     unsafe_allow_html=True,
 )
 
@@ -1136,7 +1109,7 @@ with aba_consulta:
         nome_arquivo = st.selectbox("Nome do arquivo importado", options=arquivos)
 
         st.subheader("3. Classificação antes de importar")
-        st.caption("Antes de carregar os pedidos, selecione se o arquivo é Puxada, Empurrada ou Venda Jurídica. O valor correto vem da query, somando tipo loja (ZBG_TIPO = '2') + pedidos NÃO MISTO.")
+        st.caption("Antes de carregar os pedidos, classifique manualmente se o arquivo é Puxada, Empurrada ou Venda Jurídica. O valor correto vem da query, somando tipo loja (ZBG_TIPO = '2') + pedidos NÃO MISTO, sem filtrar por C7_XTPPED.")
 
         col_tipo_demanda, col_valor_demanda, col_qtd_demanda = st.columns([1.2, 1, 1])
         with col_tipo_demanda:
@@ -1147,15 +1120,15 @@ with aba_consulta:
             )
 
         linha_arquivo = df_arquivos[df_arquivos[COLUNA_NOME_ARQUIVO] == nome_arquivo].iloc[0]
-        valor_informado_importacao = valor_tipo2_por_demanda(linha_arquivo, tipo_demanda_importacao)
-        qtd_tipo2_demanda = qtd_tipo2_por_demanda(linha_arquivo, tipo_demanda_importacao)
+        valor_informado_importacao = valor_loja_naomisto_total(linha_arquivo)
+        qtd_loja_naomisto = qtd_loja_naomisto_total(linha_arquivo)
 
         with col_valor_demanda:
             st.metric("Valor correto da query", formatar_moeda(valor_informado_importacao))
             st.caption("Soma de C7_TOTAL com tipo loja (ZBG_TIPO = '2') + pedidos NÃO MISTO.")
         with col_qtd_demanda:
-            st.metric("Pedidos loja + não misto", qtd_tipo2_demanda)
-            st.caption("Quantidade de pedidos nessa demanda.")
+            st.metric("Pedidos loja + não misto", qtd_loja_naomisto)
+            st.caption("Quantidade de pedidos loja + não misto no arquivo, sem filtrar por C7_XTPPED.")
 
         nome_carga_sugerido = (
             f"{analista} - {tipo_demanda_importacao.replace('DEMANDA ', '')} - {departamento_carga} - {nome_arquivo} - "
@@ -1164,7 +1137,7 @@ with aba_consulta:
         nome_carga = st.text_input("Nome para salvar no histórico do Neon", value=nome_carga_sugerido)
 
         if valor_informado_importacao <= 0:
-            st.warning("A query não encontrou valor para tipo loja + não misto nesta demanda/arquivo. Verifique se o tipo selecionado está correto.")
+            st.warning("A query não encontrou valor para tipo loja + não misto neste arquivo/departamento. Verifique arquivo, departamento ou se o pedido é tipo fornecedor (ZBG_TIPO = 1).")
 
         if st.button("📥 Carregar pedidos desse arquivo", type="primary", disabled=(valor_informado_importacao <= 0)):
             with st.spinner("Carregando pedidos do arquivo selecionado pela API..."):
@@ -1173,7 +1146,6 @@ with aba_consulta:
                     data_fim,
                     departamentos_selecionados,
                     nome_arquivo,
-                    tipo_demanda_importacao,
                 )
 
                 if not df_pedidos.empty:
