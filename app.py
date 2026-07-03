@@ -227,7 +227,7 @@ def montar_tabela_arquivos_display(df_arquivos):
         return pd.DataFrame()
 
     df = df_arquivos.copy()
-    for coluna in ["FILIAL", COLUNA_NOME_ARQUIVO, "VALOR_TOTAL", "DATA_EMISSAO", "STATUS"]:
+    for coluna in ["FILIAL", COLUNA_NOME_ARQUIVO, "VALOR_TOTAL", "DATA_EMISSAO"]:
         if coluna not in df.columns:
             df[coluna] = ""
 
@@ -236,9 +236,16 @@ def montar_tabela_arquivos_display(df_arquivos):
         "Nome do arquivo": df[COLUNA_NOME_ARQUIVO].apply(limpar_texto),
         "Valor": df["VALOR_TOTAL"].apply(lambda v: formatar_moeda(limpar_valor(v) or 0)),
         "Data de emissão": df["DATA_EMISSAO"].apply(formatar_data_protheus),
-        "Status": df["STATUS"].apply(status_icone),
     })
     return saida
+
+
+def lista_fornecedores(df):
+    if df is None or df.empty or COLUNA_FORNECEDOR not in df.columns:
+        return ["Todos"]
+
+    fornecedores = sorted({limpar_texto(v) for v in df[COLUNA_FORNECEDOR].dropna().tolist() if limpar_texto(v)})
+    return ["Todos"] + fornecedores
 
 
 def normalizar_nome_aba(nome):
@@ -324,10 +331,10 @@ def preparar_df_pedidos(df):
 
 def montar_tabela_planilha(df):
     if df is None or df.empty:
-        return pd.DataFrame(columns=["FILIAL", "FORNECEDOR", "PEDIDO", "MOTIVO", "Status"])
+        return pd.DataFrame(columns=["FILIAL", "FORNECEDOR", "PEDIDO", "VALOR", "MOTIVO", "Status"])
 
     df = df.copy()
-    for col in [COLUNA_LOJA, COLUNA_FORNECEDOR, COLUNA_PEDIDO, "MOTIVO", "STATUS_BANCO"]:
+    for col in [COLUNA_LOJA, COLUNA_FORNECEDOR, COLUNA_PEDIDO, COLUNA_VALOR, "MOTIVO", "STATUS_BANCO"]:
         if col not in df.columns:
             df[col] = ""
 
@@ -338,6 +345,7 @@ def montar_tabela_planilha(df):
     tabela = (
         df.groupby([COLUNA_LOJA, COLUNA_FORNECEDOR, COLUNA_PEDIDO], dropna=False)
         .agg(
+            VALOR=(COLUNA_VALOR, lambda x: sum((limpar_valor(v) or 0) for v in x)),
             MOTIVO=("MOTIVO", juntar_unicos),
             Status=("STATUS_BANCO", lambda x: "LIBERADO" if "LIBERADO" in set(x) else "BLOQUEADO"),
         )
@@ -345,9 +353,9 @@ def montar_tabela_planilha(df):
     )
 
     tabela = tabela.rename(columns={COLUNA_LOJA: "FILIAL", COLUNA_FORNECEDOR: "FORNECEDOR", COLUNA_PEDIDO: "PEDIDO"})
-    tabela = tabela[["FILIAL", "FORNECEDOR", "PEDIDO", "MOTIVO", "Status"]]
+    tabela["VALOR"] = tabela["VALOR"].apply(formatar_moeda)
+    tabela = tabela[["FILIAL", "FORNECEDOR", "PEDIDO", "VALOR", "MOTIVO", "Status"]]
     return tabela
-
 
 
 def montar_opcoes_pedido(df, filtro_fornecedor=""):
@@ -653,7 +661,7 @@ def carregar_arquivos_empresa(data_ini, data_fim, departamentos):
 
 
 
-def carregar_pedidos_empresa(data_ini, data_fim, departamentos, nome_arquivo):
+def carregar_pedidos_empresa(data_ini, data_fim, departamentos, nome_arquivo, data_emissao=None):
     if not departamentos or not nome_arquivo:
         return pd.DataFrame()
 
@@ -663,6 +671,12 @@ def carregar_pedidos_empresa(data_ini, data_fim, departamentos, nome_arquivo):
         "departamentos": [limpar_texto(d).upper() for d in departamentos],
         "nome_arquivo": limpar_texto(nome_arquivo),
     }
+    if data_emissao:
+        data_emissao_txt = limpar_texto(data_emissao)
+        if len(data_emissao_txt) == 8 and data_emissao_txt.isdigit():
+            payload["data_emissao"] = f"{data_emissao_txt[0:4]}-{data_emissao_txt[4:6]}-{data_emissao_txt[6:8]}"
+        else:
+            payload["data_emissao"] = data_emissao_txt
 
     try:
         retorno = chamar_api("POST", "/pedidos", payload=payload)
@@ -1152,8 +1166,7 @@ with aba_consulta:
             nome_label = limpar_texto(row.get(COLUNA_NOME_ARQUIVO))
             data_label = formatar_data_protheus(row.get("DATA_EMISSAO")) or "SEM DATA"
             valor_label = formatar_moeda(valor_loja_naomisto_total(row))
-            status_label = status_icone(row.get("STATUS"))
-            label = f"{filial_label} | {nome_label} | {data_label} | {valor_label} | {status_label}"
+            label = f"{filial_label} | {nome_label} | {data_label} | {valor_label}"
             opcoes_arquivos.append(label)
             mapa_opcoes_arquivos[label] = idx
 
@@ -1197,7 +1210,7 @@ with aba_consulta:
 
             st.subheader("3. Classificação antes de importar")
 
-            col_tipo_demanda, col_valor_demanda, col_data_planilha = st.columns([1.1, 1, 1])
+            col_tipo_demanda, col_data_emissao, col_valor_demanda = st.columns([1.1, 1, 1])
             with col_tipo_demanda:
                 tipo_demanda_importacao = st.selectbox(
                     "Esse(s) arquivo(s) é/são de qual tipo?",
@@ -1205,16 +1218,16 @@ with aba_consulta:
                     format_func=lambda x: x.replace("DEMANDA ", "").title().replace("Juridica", "Jurídica"),
                 )
 
+            with col_data_emissao:
+                st.text_input("Data de emissão", value=data_emissao_label, disabled=True)
+
             with col_valor_demanda:
                 st.metric("Valor Total", formatar_moeda(valor_total_arquivos))
-
-            with col_data_planilha:
-                data_planilha = st.date_input("Data que colocou na planilha", value=hoje, format="DD/MM/YYYY")
 
             tipo_demanda_resumido = tipo_demanda_importacao.replace("DEMANDA ", "")
             nome_carga_sugerido = (
                 f"{analista} | {tipo_demanda_resumido} | {nomes_arquivo_label} | "
-                f"Emissão: {data_emissao_label} | Planilha: {data_planilha.strftime('%d/%m/%Y')}"
+                f"Emissão: {data_emissao_label}"
             )
             nome_carga = st.text_input("Nome para salvar no histórico do Neon", value=nome_carga_sugerido)
 
@@ -1224,15 +1237,19 @@ with aba_consulta:
             if st.button("📥 Carregar pedidos dos arquivos selecionados", type="primary"):
                 with st.spinner("Carregando pedidos dos arquivos selecionados pela API..."):
                     lista_dfs = []
-                    for nome_arquivo in nomes_arquivos:
+                    for _, linha_arquivo in df_linhas_selecionadas.iterrows():
+                        nome_arquivo = limpar_texto(linha_arquivo.get(COLUNA_NOME_ARQUIVO))
+                        data_emissao_api = limpar_texto(linha_arquivo.get("DATA_EMISSAO"))
                         df_pedidos_arquivo = carregar_pedidos_empresa(
                             data_ini,
                             data_fim,
                             departamentos_selecionados,
                             nome_arquivo,
+                            data_emissao=data_emissao_api,
                         )
                         if not df_pedidos_arquivo.empty:
                             df_pedidos_arquivo[COLUNA_NOME_ARQUIVO] = nome_arquivo
+                            df_pedidos_arquivo["DATA_EMISSAO_ARQUIVO"] = data_emissao_api
                             lista_dfs.append(df_pedidos_arquivo)
 
                     if lista_dfs:
@@ -1242,10 +1259,10 @@ with aba_consulta:
 
                     if not df_pedidos.empty:
                         df_pedidos[COLUNA_DEMANDA] = tipo_demanda_importacao
+                        df_pedidos["MOTIVO"] = nome_carga
                         df_pedidos["VALOR_INFORMADO_IMPORTACAO"] = float(valor_total_arquivos)
                         df_pedidos["VALOR_REFERENCIA_ARQUIVO_QUERY"] = float(valor_total_arquivos)
                         df_pedidos["TIPO_IMPORTACAO"] = tipo_demanda_importacao
-                        df_pedidos["DATA_PLANILHA"] = data_planilha.strftime("%Y-%m-%d")
 
                     st.session_state["df_pedidos_empresa"] = df_pedidos
                     st.session_state["nome_arquivo_selecionado"] = nomes_arquivo_label
@@ -1253,7 +1270,6 @@ with aba_consulta:
                     st.session_state["nome_carga"] = nome_carga
                     st.session_state["data_ini"] = data_ini
                     st.session_state["data_fim"] = data_fim
-                    st.session_state["data_planilha"] = data_planilha
                     st.session_state["analista"] = analista
                     st.session_state["departamentos_selecionados"] = departamentos_selecionados
                     st.session_state["departamento"] = departamento_carga
@@ -1278,7 +1294,9 @@ with aba_consulta:
         st.subheader("4. Remover pedidos errados desta importação")
         st.caption("Use esse campo quando algum pedido entrou por engano. Ele será retirado desta importação, mas ficará registrado como removido quando você salvar no Neon.")
 
-        filtro_fornecedor_remover = st.text_input("Filtrar fornecedor para selecionar pedido a remover")
+        fornecedores_remover = lista_fornecedores(df_base)
+        fornecedor_remover_sel = st.selectbox("Filtrar fornecedor para selecionar pedido a remover", options=fornecedores_remover)
+        filtro_fornecedor_remover = "" if fornecedor_remover_sel == "Todos" else fornecedor_remover_sel
         mapa_remover, opcoes_remover = montar_opcoes_pedido(df_base, filtro_fornecedor_remover)
         labels_remover = st.multiselect(
             "Tem algum pedido que deseja remover desta importação?",
@@ -1297,30 +1315,16 @@ with aba_consulta:
         st.divider()
         st.subheader("5. Pedidos encontrados")
 
-        total_linhas = len(df_final)
         total_pedidos = df_final[COLUNA_PEDIDO].nunique() if COLUNA_PEDIDO in df_final.columns else len(df_final)
         total_liberados = df_final.loc[df_final["STATUS_BANCO"] == "LIBERADO", COLUNA_PEDIDO].nunique() if "STATUS_BANCO" in df_final.columns else 0
         total_bloqueados = df_final.loc[df_final["STATUS_BANCO"] == "BLOQUEADO", COLUNA_PEDIDO].nunique() if "STATUS_BANCO" in df_final.columns else 0
         total_valor = df_final[COLUNA_VALOR].fillna(0).sum() if COLUNA_VALOR in df_final.columns else 0
 
-        valor_informado_importacao = limpar_valor(st.session_state.get("valor_informado_importacao", 0)) or 0.0
-        diferenca_valor = total_valor - valor_informado_importacao
-
-        m1, m2, m3, m4, m5, m6, m7, m8 = st.columns(8)
-        m1.metric("Linhas", total_linhas)
-        m2.metric("Pedidos únicos", total_pedidos)
-        m3.metric("Liberados", int(total_liberados))
-        m4.metric("Bloqueados", int(total_bloqueados))
-        m5.metric("Removidos", len(pedidos_remover))
-        m6.metric("Soma pedidos", formatar_moeda(total_valor))
-        m7.metric("Valor total", formatar_moeda(valor_informado_importacao))
-        m8.metric("Diferença", formatar_moeda(diferenca_valor))
-
-        if abs(diferenca_valor) > 0.01:
-            st.warning(
-                f"A soma dos pedidos carregados ({formatar_moeda(total_valor)}) está diferente do valor do arquivo "
-                f"({formatar_moeda(valor_informado_importacao)}). Diferença: {formatar_moeda(diferenca_valor)}."
-            )
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Pedidos", int(total_pedidos))
+        m2.metric("Liberados", int(total_liberados))
+        m3.metric("Bloqueados", int(total_bloqueados))
+        m4.metric("Valor Total", formatar_moeda(total_valor))
 
         abas_demandas = st.tabs(["Demanda Puxada", "Demanda Empurrada", "Demanda Venda Jurídica", "Substituição"])
         tabelas_excel = {}
@@ -1343,7 +1347,9 @@ with aba_consulta:
             st.markdown("### Substituição de pedido")
             st.caption("Registre aqui quando um pedido precisou ser refeito. O histórico guarda o pedido antigo e o novo, mesmo que o pedido seja refeito várias vezes.")
 
-            filtro_fornecedor_sub = st.text_input("Filtrar fornecedor para escolher o pedido antigo", key="filtro_fornecedor_sub")
+            fornecedores_sub = lista_fornecedores(df_final)
+            fornecedor_sub_sel = st.selectbox("Filtrar fornecedor para escolher o pedido antigo", options=fornecedores_sub, key="filtro_fornecedor_sub_sel")
+            filtro_fornecedor_sub = "" if fornecedor_sub_sel == "Todos" else fornecedor_sub_sel
             mapa_sub, opcoes_sub = montar_opcoes_pedido(df_final, filtro_fornecedor_sub)
 
             if not opcoes_sub:
