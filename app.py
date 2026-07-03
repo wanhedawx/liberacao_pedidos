@@ -33,6 +33,7 @@ COLUNA_NOME_ARQUIVO = "NOME_ARQUIVO"
 COLUNA_DATA = "DT_EMISSAO"
 COLUNA_DEMANDA = "DEMANDA"
 COLUNA_COD_TIPO_PEDIDO_TOTVS = "COD_TIPO_PEDIDO_TOTVS"
+COLUNA_OBSERVACAO = "OBSERVACAO"
 
 VALORES_STATUS_LIBERADO = {"L", "LIBERADO", "LIBERADA", "APROVADO", "APROVADA", "S", "SIM", "OK"}
 DEMANDAS = ["DEMANDA PUXADA", "DEMANDA EMPURRADA", "DEMANDA VENDA JURIDICA"]
@@ -308,6 +309,7 @@ def preparar_df_pedidos(df):
         (COLUNA_DEPARTAMENTO, ""),
         (COLUNA_NOME_ARQUIVO, ""),
         ("MOTIVO", ""),
+        (COLUNA_OBSERVACAO, ""),
         ("STATUS_BANCO", "NÃO INFORMADO"),
         ("COD_STATUS_BANCO", ""),
         (COLUNA_VALOR, None),
@@ -323,6 +325,9 @@ def preparar_df_pedidos(df):
     df["STATUS_BANCO"] = df["STATUS_BANCO"].apply(normalizar_status)
     df["COD_STATUS_BANCO"] = df["COD_STATUS_BANCO"].apply(limpar_texto)
     df["MOTIVO"] = df["MOTIVO"].apply(limpar_texto)
+    df[COLUNA_OBSERVACAO] = df[COLUNA_OBSERVACAO].apply(limpar_texto)
+    # Compatibilidade: se vier só MOTIVO, usa como OBSERVACAO.
+    df.loc[df[COLUNA_OBSERVACAO] == "", COLUNA_OBSERVACAO] = df.loc[df[COLUNA_OBSERVACAO] == "", "MOTIVO"]
     df[COLUNA_DEMANDA] = df.apply(definir_demanda, axis=1)
 
     return df.drop_duplicates().copy()
@@ -331,31 +336,71 @@ def preparar_df_pedidos(df):
 
 def montar_tabela_planilha(df):
     if df is None or df.empty:
-        return pd.DataFrame(columns=["FILIAL", "FORNECEDOR", "PEDIDO", "VALOR", "MOTIVO", "Status"])
+        return pd.DataFrame(columns=["DEPARTAMENTO", "FILIAL", "FORNECEDOR", "PEDIDO", "VALOR", "OBSERVAÇÃO", "Status"])
 
     df = df.copy()
-    for col in [COLUNA_LOJA, COLUNA_FORNECEDOR, COLUNA_PEDIDO, COLUNA_VALOR, "MOTIVO", "STATUS_BANCO"]:
+    for col in [COLUNA_DEPARTAMENTO, COLUNA_LOJA, COLUNA_FORNECEDOR, COLUNA_PEDIDO, COLUNA_VALOR, COLUNA_OBSERVACAO, "MOTIVO", "STATUS_BANCO"]:
         if col not in df.columns:
             df[col] = ""
+
+    # Compatibilidade: se a observação ainda estiver em MOTIVO, aproveita ela.
+    df[COLUNA_OBSERVACAO] = df[COLUNA_OBSERVACAO].apply(limpar_texto)
+    df.loc[df[COLUNA_OBSERVACAO] == "", COLUNA_OBSERVACAO] = df.loc[df[COLUNA_OBSERVACAO] == "", "MOTIVO"].apply(limpar_texto)
+    df[COLUNA_DEPARTAMENTO] = df[COLUNA_DEPARTAMENTO].apply(limpar_texto).replace("", "SEM DEPARTAMENTO")
 
     def juntar_unicos(serie):
         valores = [limpar_texto(v) for v in serie if limpar_texto(v)]
         return "; ".join(sorted(set(valores)))
 
     tabela = (
-        df.groupby([COLUNA_LOJA, COLUNA_FORNECEDOR, COLUNA_PEDIDO], dropna=False)
+        df.groupby([COLUNA_DEPARTAMENTO, COLUNA_LOJA, COLUNA_FORNECEDOR, COLUNA_PEDIDO], dropna=False)
         .agg(
             VALOR=(COLUNA_VALOR, lambda x: sum((limpar_valor(v) or 0) for v in x)),
-            MOTIVO=("MOTIVO", juntar_unicos),
+            OBSERVACAO=(COLUNA_OBSERVACAO, juntar_unicos),
             Status=("STATUS_BANCO", lambda x: "LIBERADO" if "LIBERADO" in set(x) else "BLOQUEADO"),
         )
         .reset_index()
     )
 
-    tabela = tabela.rename(columns={COLUNA_LOJA: "FILIAL", COLUNA_FORNECEDOR: "FORNECEDOR", COLUNA_PEDIDO: "PEDIDO"})
+    tabela = tabela.rename(columns={
+        COLUNA_DEPARTAMENTO: "DEPARTAMENTO",
+        COLUNA_LOJA: "FILIAL",
+        COLUNA_FORNECEDOR: "FORNECEDOR",
+        COLUNA_PEDIDO: "PEDIDO",
+        "OBSERVACAO": "OBSERVAÇÃO",
+    })
     tabela["VALOR"] = tabela["VALOR"].apply(formatar_moeda)
-    tabela = tabela[["FILIAL", "FORNECEDOR", "PEDIDO", "VALOR", "MOTIVO", "Status"]]
+    tabela = tabela[["DEPARTAMENTO", "FILIAL", "FORNECEDOR", "PEDIDO", "VALOR", "OBSERVAÇÃO", "Status"]]
     return tabela
+
+
+
+def montar_resumo_departamento(df):
+    if df is None or df.empty:
+        return pd.DataFrame(columns=["Departamento", "Pedidos", "Liberados", "Bloqueados", "Valor Total"])
+
+    df = df.copy()
+    for col in [COLUNA_DEPARTAMENTO, COLUNA_PEDIDO, COLUNA_VALOR, "STATUS_BANCO"]:
+        if col not in df.columns:
+            df[col] = ""
+
+    df[COLUNA_DEPARTAMENTO] = df[COLUNA_DEPARTAMENTO].apply(limpar_texto).replace("", "SEM DEPARTAMENTO")
+
+    resumo = (
+        df.groupby(COLUNA_DEPARTAMENTO, dropna=False)
+        .agg(
+            Pedidos=(COLUNA_PEDIDO, "nunique"),
+            Liberados=(COLUNA_PEDIDO, lambda x: df.loc[x.index][df.loc[x.index, "STATUS_BANCO"] == "LIBERADO"][COLUNA_PEDIDO].nunique()),
+            Bloqueados=(COLUNA_PEDIDO, lambda x: df.loc[x.index][df.loc[x.index, "STATUS_BANCO"] == "BLOQUEADO"][COLUNA_PEDIDO].nunique()),
+            Valor=(COLUNA_VALOR, lambda x: sum((limpar_valor(v) or 0) for v in x)),
+        )
+        .reset_index()
+        .rename(columns={COLUNA_DEPARTAMENTO: "Departamento"})
+    )
+
+    resumo["Valor Total"] = resumo["Valor"].apply(formatar_moeda)
+    resumo = resumo[["Departamento", "Pedidos", "Liberados", "Bloqueados", "Valor Total"]]
+    return resumo.sort_values("Departamento").reset_index(drop=True)
 
 
 def montar_opcoes_pedido(df, filtro_fornecedor=""):
@@ -1225,11 +1270,15 @@ with aba_consulta:
                 st.metric("Valor Total", formatar_moeda(valor_total_arquivos))
 
             tipo_demanda_resumido = tipo_demanda_importacao.replace("DEMANDA ", "")
-            nome_carga_sugerido = (
-                f"{analista} | {tipo_demanda_resumido} | {nomes_arquivo_label} | "
-                f"Emissão: {data_emissao_label}"
+            observacao_sugerida = nomes_arquivo_label
+            observacao_importacao = st.text_input(
+                "Observação",
+                value=observacao_sugerida,
+                help="Essa observação será gravada na coluna OBSERVAÇÃO dos pedidos e no histórico do Neon.",
             )
-            nome_carga = st.text_input("Nome para salvar no histórico do Neon", value=nome_carga_sugerido)
+            nome_carga = limpar_texto(observacao_importacao) or (
+                f"{analista} | {tipo_demanda_resumido} | {nomes_arquivo_label} | Emissão: {data_emissao_label}"
+            )
 
             if valor_total_arquivos <= 0:
                 st.warning("A query retornou valor zerado para o(s) arquivo(s)/departamento(s) selecionado(s).")
@@ -1259,7 +1308,8 @@ with aba_consulta:
 
                     if not df_pedidos.empty:
                         df_pedidos[COLUNA_DEMANDA] = tipo_demanda_importacao
-                        df_pedidos["MOTIVO"] = nome_carga
+                        df_pedidos[COLUNA_OBSERVACAO] = nome_carga
+                        df_pedidos["MOTIVO"] = nome_carga  # compatibilidade com histórico anterior
                         df_pedidos["VALOR_INFORMADO_IMPORTACAO"] = float(valor_total_arquivos)
                         df_pedidos["VALOR_REFERENCIA_ARQUIVO_QUERY"] = float(valor_total_arquivos)
                         df_pedidos["TIPO_IMPORTACAO"] = tipo_demanda_importacao
@@ -1289,6 +1339,12 @@ with aba_consulta:
             df_base[COLUNA_DEMANDA] = tipo_demanda_importacao
             df_base["TIPO_IMPORTACAO"] = tipo_demanda_importacao
             df_base["VALOR_INFORMADO_IMPORTACAO"] = float(valor_informado_importacao)
+            observacao_atual = limpar_texto(st.session_state.get("nome_carga", ""))
+            if COLUNA_OBSERVACAO not in df_base.columns:
+                df_base[COLUNA_OBSERVACAO] = observacao_atual
+            else:
+                df_base[COLUNA_OBSERVACAO] = df_base[COLUNA_OBSERVACAO].replace("", observacao_atual)
+            df_base["MOTIVO"] = df_base[COLUNA_OBSERVACAO]
 
         st.divider()
         st.subheader("4. Remover pedidos errados desta importação")
@@ -1312,19 +1368,26 @@ with aba_consulta:
         df_removidos = df_base[df_base[COLUNA_PEDIDO].isin(pedidos_remover)].copy()
         df_final = df_base[~df_base[COLUNA_PEDIDO].isin(pedidos_remover)].copy()
 
+        if not df_removidos.empty:
+            st.markdown("**Pedidos removidos desta importação**")
+            tabela_removidos = montar_tabela_planilha(df_removidos)
+            st.dataframe(tabela_removidos, use_container_width=True, hide_index=True)
+
         st.divider()
         st.subheader("5. Pedidos encontrados")
 
         total_pedidos = df_final[COLUNA_PEDIDO].nunique() if COLUNA_PEDIDO in df_final.columns else len(df_final)
         total_liberados = df_final.loc[df_final["STATUS_BANCO"] == "LIBERADO", COLUNA_PEDIDO].nunique() if "STATUS_BANCO" in df_final.columns else 0
         total_bloqueados = df_final.loc[df_final["STATUS_BANCO"] == "BLOQUEADO", COLUNA_PEDIDO].nunique() if "STATUS_BANCO" in df_final.columns else 0
+        total_removidos = df_removidos[COLUNA_PEDIDO].nunique() if not df_removidos.empty and COLUNA_PEDIDO in df_removidos.columns else 0
         total_valor = df_final[COLUNA_VALOR].fillna(0).sum() if COLUNA_VALOR in df_final.columns else 0
 
-        m1, m2, m3, m4 = st.columns(4)
+        m1, m2, m3, m4, m5 = st.columns(5)
         m1.metric("Pedidos", int(total_pedidos))
         m2.metric("Liberados", int(total_liberados))
         m3.metric("Bloqueados", int(total_bloqueados))
-        m4.metric("Valor Total", formatar_moeda(total_valor))
+        m4.metric("Removidos", int(total_removidos))
+        m5.metric("Valor Total", formatar_moeda(total_valor))
 
         abas_demandas = st.tabs(["Demanda Puxada", "Demanda Empurrada", "Demanda Venda Jurídica", "Substituição"])
         tabelas_excel = {}
@@ -1332,16 +1395,42 @@ with aba_consulta:
         for demanda_nome, aba in zip(DEMANDAS, abas_demandas[:3]):
             with aba:
                 df_demanda = df_final[df_final[COLUNA_DEMANDA] == demanda_nome].copy()
-                tabela_planilha = montar_tabela_planilha(df_demanda)
-                tabelas_excel[demanda_nome] = tabela_planilha
+                tabela_planilha_export = montar_tabela_planilha(df_demanda)
+                tabelas_excel[demanda_nome] = tabela_planilha_export
 
                 st.markdown(f"### {demanda_nome.title()}")
-                if tabela_planilha.empty:
+                if df_demanda.empty:
                     st.info("Nenhum pedido nesta demanda para os filtros selecionados.")
                 else:
+                    st.markdown("**Resumo por departamento**")
+                    resumo_departamento = montar_resumo_departamento(df_demanda)
+                    st.dataframe(resumo_departamento, use_container_width=True, hide_index=True)
+
+                    departamentos_demanda = sorted({
+                        limpar_texto(v) or "SEM DEPARTAMENTO"
+                        for v in df_demanda.get(COLUNA_DEPARTAMENTO, pd.Series(dtype=str)).dropna().tolist()
+                    })
+
+                    if len(departamentos_demanda) > 1:
+                        departamentos_visiveis = st.multiselect(
+                            "Filtrar departamento nesta aba",
+                            options=departamentos_demanda,
+                            default=departamentos_demanda,
+                            key=f"filtro_depto_{demanda_nome}",
+                        )
+                    else:
+                        departamentos_visiveis = departamentos_demanda
+
+                    df_demanda_view = df_demanda.copy()
+                    if departamentos_visiveis:
+                        depto_norm = df_demanda_view[COLUNA_DEPARTAMENTO].apply(limpar_texto).replace("", "SEM DEPARTAMENTO")
+                        df_demanda_view = df_demanda_view[depto_norm.isin(departamentos_visiveis)].copy()
+
+                    tabela_planilha = montar_tabela_planilha(df_demanda_view)
                     st.dataframe(tabela_planilha, use_container_width=True, hide_index=True)
+
                     with st.expander("Ver detalhes dos produtos"):
-                        st.dataframe(df_demanda, use_container_width=True, hide_index=True)
+                        st.dataframe(df_demanda_view, use_container_width=True, hide_index=True)
 
         with abas_demandas[3]:
             st.markdown("### Substituição de pedido")
