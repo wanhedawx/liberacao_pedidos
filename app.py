@@ -86,11 +86,11 @@ TODOS_DEPARTAMENTOS = sorted({
 st.markdown(
     """
     <style>
-        .block-container { padding-top: 1.5rem; }
+        .block-container { padding-top: 2.5rem; }
         .titulo-principal {
             font-size: 34px;
             font-weight: 800;
-            margin-bottom: 4px;
+            margin-bottom: 18px;
         }
         .subtitulo {
             color: #A0A0A0;
@@ -181,22 +181,64 @@ def formatar_moeda(valor):
         return "R$ 0,00"
 
 
+def status_icone(valor):
+    status = limpar_texto(valor).upper()
+    if "LIBERADO" in status or status in {"L", "OK", "✅"}:
+        return "✅"
+    if "BLOQUEADO" in status or status in {"B", "❌", "X"}:
+        return "❌"
+    return status or "-"
+
+
 def valor_loja_naomisto_total(linha_arquivo):
-    """Retorna a soma correta da importação: tipo loja (ZBG_TIPO = '2') + pedidos NÃO MISTO, sem filtrar por C7_XTPPED."""
-    for coluna in [COLUNA_VALOR_LOJA_NAOMISTO_TOTAL, "VALOR_TIPO2_TOTAL"]:
+    """Retorna o valor total do arquivo calculado pela query, sem duplicar itens."""
+    for coluna in ["VALOR_TOTAL", "VALOR_ARQUIVO", COLUNA_VALOR_LOJA_NAOMISTO_TOTAL, "VALOR_TIPO2_TOTAL"]:
         if coluna in linha_arquivo.index:
             return limpar_valor(linha_arquivo.get(coluna)) or 0.0
     return 0.0
 
 
 def qtd_loja_naomisto_total(linha_arquivo):
-    for coluna in [COLUNA_QTD_LOJA_NAOMISTO, "QTD_PEDIDOS_TIPO2"]:
+    for coluna in ["QTD_PEDIDOS", COLUNA_QTD_LOJA_NAOMISTO, "QTD_PEDIDOS_TIPO2"]:
         if coluna in linha_arquivo.index:
             try:
                 return int(float(linha_arquivo.get(coluna) or 0))
             except Exception:
                 return 0
     return 0
+
+
+def formatar_data_protheus(valor):
+    valor_txt = limpar_texto(valor)
+    if not valor_txt:
+        return ""
+    if len(valor_txt) >= 10 and "-" in valor_txt:
+        try:
+            return pd.to_datetime(valor_txt).strftime("%d/%m/%Y")
+        except Exception:
+            return valor_txt
+    if len(valor_txt) == 8 and valor_txt.isdigit():
+        return f"{valor_txt[6:8]}/{valor_txt[4:6]}/{valor_txt[0:4]}"
+    return valor_txt
+
+
+def montar_tabela_arquivos_display(df_arquivos):
+    if df_arquivos.empty:
+        return pd.DataFrame()
+
+    df = df_arquivos.copy()
+    for coluna in ["FILIAL", COLUNA_NOME_ARQUIVO, "VALOR_TOTAL", "DATA_EMISSAO", "STATUS"]:
+        if coluna not in df.columns:
+            df[coluna] = ""
+
+    saida = pd.DataFrame({
+        "Filial": df["FILIAL"].apply(limpar_texto),
+        "Nome do arquivo": df[COLUNA_NOME_ARQUIVO].apply(limpar_texto),
+        "Valor": df["VALOR_TOTAL"].apply(lambda v: formatar_moeda(limpar_valor(v) or 0)),
+        "Data de emissão": df["DATA_EMISSAO"].apply(formatar_data_protheus),
+        "Status": df["STATUS"].apply(status_icone),
+    })
+    return saida
 
 
 def normalizar_nome_aba(nome):
@@ -1010,32 +1052,26 @@ def carregar_historico_substituicoes_neon(nome_arquivo=None):
 # =========================================================
 
 st.markdown('<div class="titulo-principal">📦 Liberação de Pedidos</div>', unsafe_allow_html=True)
-st.markdown(
-    '<div class="subtitulo">Consulta via API FastAPI, permite remover pedidos errados, classificar por demanda e manter histórico de substituições no Neon/PostgreSQL.</div>',
-    unsafe_allow_html=True,
-)
-
 ok_neon, msg_neon = testar_conexao_neon()
 ok_api, msg_api = testar_conexao_api()
 
 with st.sidebar:
-    st.header("Conexões")
+    usuario_importacao = st.text_input("Usuário", value="Vitoria")
 
     if ok_neon:
-        st.success("Neon conectado")
         criar_tabelas_neon()
-    else:
-        st.error("Neon não conectado")
-        st.caption(msg_neon)
 
-    if ok_api:
-        st.success("API da empresa conectada")
-    else:
-        st.error("API da empresa não conectada")
-        st.caption(msg_api)
+    if not ok_neon or not ok_api:
+        st.divider()
+        st.header("Conexões")
 
-    st.divider()
-    usuario_importacao = st.text_input("Usuário", value="Vitoria")
+        if not ok_neon:
+            st.error("Neon não conectado")
+            st.caption(msg_neon)
+
+        if not ok_api:
+            st.error("API da empresa não conectada")
+            st.caption(msg_api)
 
 aba_consulta, aba_historico, aba_config = st.tabs([
     "🔎 Consultar banco da empresa",
@@ -1102,69 +1138,127 @@ with aba_consulta:
     df_arquivos = st.session_state.get("df_arquivos_empresa", pd.DataFrame())
 
     if not df_arquivos.empty:
-        st.subheader("2. Escolha o arquivo importado")
-        st.dataframe(df_arquivos, use_container_width=True, hide_index=True)
+        st.subheader("2. Escolha o(s) arquivo(s) importado(s)")
 
-        arquivos = df_arquivos[COLUNA_NOME_ARQUIVO].dropna().astype(str).drop_duplicates().tolist()
-        nome_arquivo = st.selectbox("Nome do arquivo importado", options=arquivos)
+        tabela_arquivos = montar_tabela_arquivos_display(df_arquivos)
+        st.dataframe(tabela_arquivos, use_container_width=True, hide_index=True)
 
-        st.subheader("3. Classificação antes de importar")
-        st.caption("Antes de carregar os pedidos, classifique manualmente se o arquivo é Puxada, Empurrada ou Venda Jurídica. O valor correto vem da query, somando tipo loja (ZBG_TIPO = '2') + pedidos NÃO MISTO, sem filtrar por C7_XTPPED.")
+        df_arquivos_opcoes = df_arquivos.reset_index(drop=True).copy()
+        opcoes_arquivos = []
+        mapa_opcoes_arquivos = {}
 
-        col_tipo_demanda, col_valor_demanda, col_qtd_demanda = st.columns([1.2, 1, 1])
-        with col_tipo_demanda:
-            tipo_demanda_importacao = st.selectbox(
-                "Esse arquivo é de qual tipo?",
-                options=DEMANDAS,
-                format_func=lambda x: x.replace("DEMANDA ", "").title().replace("Juridica", "Jurídica"),
-            )
+        for idx, row in df_arquivos_opcoes.iterrows():
+            filial_label = limpar_texto(row.get("FILIAL")) or "SEM FILIAL"
+            nome_label = limpar_texto(row.get(COLUNA_NOME_ARQUIVO))
+            data_label = formatar_data_protheus(row.get("DATA_EMISSAO")) or "SEM DATA"
+            valor_label = formatar_moeda(valor_loja_naomisto_total(row))
+            status_label = status_icone(row.get("STATUS"))
+            label = f"{filial_label} | {nome_label} | {data_label} | {valor_label} | {status_label}"
+            opcoes_arquivos.append(label)
+            mapa_opcoes_arquivos[label] = idx
 
-        linha_arquivo = df_arquivos[df_arquivos[COLUNA_NOME_ARQUIVO] == nome_arquivo].iloc[0]
-        valor_informado_importacao = valor_loja_naomisto_total(linha_arquivo)
-        qtd_loja_naomisto = qtd_loja_naomisto_total(linha_arquivo)
-
-        with col_valor_demanda:
-            st.metric("Valor correto da query", formatar_moeda(valor_informado_importacao))
-            st.caption("Soma de C7_TOTAL com tipo loja (ZBG_TIPO = '2') + pedidos NÃO MISTO.")
-        with col_qtd_demanda:
-            st.metric("Pedidos loja + não misto", qtd_loja_naomisto)
-            st.caption("Quantidade de pedidos loja + não misto no arquivo, sem filtrar por C7_XTPPED.")
-
-        nome_carga_sugerido = (
-            f"{analista} - {tipo_demanda_importacao.replace('DEMANDA ', '')} - {departamento_carga} - {nome_arquivo} - "
-            f"{data_ini.strftime('%d/%m/%Y')} a {data_fim.strftime('%d/%m/%Y')}"
+        arquivos_selecionados_labels = st.multiselect(
+            "Nome do(s) arquivo(s) importado(s)",
+            options=opcoes_arquivos,
+            default=[],
+            help="Selecione um ou mais arquivos para carregar na mesma importação.",
         )
-        nome_carga = st.text_input("Nome para salvar no histórico do Neon", value=nome_carga_sugerido)
 
-        if valor_informado_importacao <= 0:
-            st.warning("A query não encontrou valor para tipo loja + não misto neste arquivo/departamento. Verifique arquivo, departamento ou se o pedido é tipo fornecedor (ZBG_TIPO = 1).")
+        if arquivos_selecionados_labels:
+            linhas_selecionadas = [
+                df_arquivos_opcoes.iloc[mapa_opcoes_arquivos[label]]
+                for label in arquivos_selecionados_labels
+                if label in mapa_opcoes_arquivos
+            ]
+            df_linhas_selecionadas = pd.DataFrame(linhas_selecionadas)
 
-        if st.button("📥 Carregar pedidos desse arquivo", type="primary", disabled=(valor_informado_importacao <= 0)):
-            with st.spinner("Carregando pedidos do arquivo selecionado pela API..."):
-                df_pedidos = carregar_pedidos_empresa(
-                    data_ini,
-                    data_fim,
-                    departamentos_selecionados,
-                    nome_arquivo,
+            nomes_arquivos = []
+            for _, row in df_linhas_selecionadas.iterrows():
+                nome_tmp = limpar_texto(row.get(COLUNA_NOME_ARQUIVO))
+                if nome_tmp and nome_tmp not in nomes_arquivos:
+                    nomes_arquivos.append(nome_tmp)
+
+            nomes_arquivo_label = "; ".join(nomes_arquivos)
+            valor_total_arquivos = float(sum(valor_loja_naomisto_total(row) for _, row in df_linhas_selecionadas.iterrows()))
+
+            datas_raw = []
+            for _, row in df_linhas_selecionadas.iterrows():
+                raw = limpar_texto(row.get("DATA_EMISSAO"))
+                if raw and raw not in datas_raw:
+                    datas_raw.append(raw)
+
+            datas_raw_ordenadas = sorted(datas_raw)
+            if len(datas_raw_ordenadas) == 1:
+                data_emissao_label = formatar_data_protheus(datas_raw_ordenadas[0])
+            elif len(datas_raw_ordenadas) > 1:
+                data_emissao_label = f"{formatar_data_protheus(datas_raw_ordenadas[0])} a {formatar_data_protheus(datas_raw_ordenadas[-1])}"
+            else:
+                data_emissao_label = "-"
+
+            st.subheader("3. Classificação antes de importar")
+
+            col_tipo_demanda, col_valor_demanda, col_data_planilha = st.columns([1.1, 1, 1])
+            with col_tipo_demanda:
+                tipo_demanda_importacao = st.selectbox(
+                    "Esse(s) arquivo(s) é/são de qual tipo?",
+                    options=DEMANDAS,
+                    format_func=lambda x: x.replace("DEMANDA ", "").title().replace("Juridica", "Jurídica"),
                 )
 
-                if not df_pedidos.empty:
-                    df_pedidos[COLUNA_DEMANDA] = tipo_demanda_importacao
-                    df_pedidos["VALOR_INFORMADO_IMPORTACAO"] = float(valor_informado_importacao)
-                    df_pedidos["VALOR_REFERENCIA_LOJA_NAOMISTO_QUERY"] = float(valor_informado_importacao)
-                    df_pedidos["TIPO_IMPORTACAO"] = tipo_demanda_importacao
+            with col_valor_demanda:
+                st.metric("Valor Total", formatar_moeda(valor_total_arquivos))
 
-                st.session_state["df_pedidos_empresa"] = df_pedidos
-                st.session_state["nome_arquivo_selecionado"] = nome_arquivo
-                st.session_state["nome_carga"] = nome_carga
-                st.session_state["data_ini"] = data_ini
-                st.session_state["data_fim"] = data_fim
-                st.session_state["analista"] = analista
-                st.session_state["departamentos_selecionados"] = departamentos_selecionados
-                st.session_state["departamento"] = departamento_carga
-                st.session_state["tipo_demanda_importacao"] = tipo_demanda_importacao
-                st.session_state["valor_informado_importacao"] = float(valor_informado_importacao)
+            with col_data_planilha:
+                data_planilha = st.date_input("Data que colocou na planilha", value=hoje, format="DD/MM/YYYY")
 
+            tipo_demanda_resumido = tipo_demanda_importacao.replace("DEMANDA ", "")
+            nome_carga_sugerido = (
+                f"{analista} | {tipo_demanda_resumido} | {nomes_arquivo_label} | "
+                f"Emissão: {data_emissao_label} | Planilha: {data_planilha.strftime('%d/%m/%Y')}"
+            )
+            nome_carga = st.text_input("Nome para salvar no histórico do Neon", value=nome_carga_sugerido)
+
+            if valor_total_arquivos <= 0:
+                st.warning("A query retornou valor zerado para o(s) arquivo(s)/departamento(s) selecionado(s).")
+
+            if st.button("📥 Carregar pedidos dos arquivos selecionados", type="primary"):
+                with st.spinner("Carregando pedidos dos arquivos selecionados pela API..."):
+                    lista_dfs = []
+                    for nome_arquivo in nomes_arquivos:
+                        df_pedidos_arquivo = carregar_pedidos_empresa(
+                            data_ini,
+                            data_fim,
+                            departamentos_selecionados,
+                            nome_arquivo,
+                        )
+                        if not df_pedidos_arquivo.empty:
+                            df_pedidos_arquivo[COLUNA_NOME_ARQUIVO] = nome_arquivo
+                            lista_dfs.append(df_pedidos_arquivo)
+
+                    if lista_dfs:
+                        df_pedidos = pd.concat(lista_dfs, ignore_index=True).drop_duplicates().copy()
+                    else:
+                        df_pedidos = pd.DataFrame()
+
+                    if not df_pedidos.empty:
+                        df_pedidos[COLUNA_DEMANDA] = tipo_demanda_importacao
+                        df_pedidos["VALOR_INFORMADO_IMPORTACAO"] = float(valor_total_arquivos)
+                        df_pedidos["VALOR_REFERENCIA_ARQUIVO_QUERY"] = float(valor_total_arquivos)
+                        df_pedidos["TIPO_IMPORTACAO"] = tipo_demanda_importacao
+                        df_pedidos["DATA_PLANILHA"] = data_planilha.strftime("%Y-%m-%d")
+
+                    st.session_state["df_pedidos_empresa"] = df_pedidos
+                    st.session_state["nome_arquivo_selecionado"] = nomes_arquivo_label
+                    st.session_state["nomes_arquivos_selecionados"] = nomes_arquivos
+                    st.session_state["nome_carga"] = nome_carga
+                    st.session_state["data_ini"] = data_ini
+                    st.session_state["data_fim"] = data_fim
+                    st.session_state["data_planilha"] = data_planilha
+                    st.session_state["analista"] = analista
+                    st.session_state["departamentos_selecionados"] = departamentos_selecionados
+                    st.session_state["departamento"] = departamento_carga
+                    st.session_state["tipo_demanda_importacao"] = tipo_demanda_importacao
+                    st.session_state["valor_informado_importacao"] = float(valor_total_arquivos)
     elif buscar:
         st.warning("Nenhum arquivo encontrado para os filtros selecionados.")
 
@@ -1219,12 +1313,12 @@ with aba_consulta:
         m4.metric("Bloqueados", int(total_bloqueados))
         m5.metric("Removidos", len(pedidos_remover))
         m6.metric("Soma pedidos", formatar_moeda(total_valor))
-        m7.metric("Valor query tipo loja + não misto", formatar_moeda(valor_informado_importacao))
+        m7.metric("Valor total", formatar_moeda(valor_informado_importacao))
         m8.metric("Diferença", formatar_moeda(diferenca_valor))
 
         if abs(diferenca_valor) > 0.01:
             st.warning(
-                f"A soma dos pedidos carregados ({formatar_moeda(total_valor)}) está diferente do valor da query tipo loja + não misto "
+                f"A soma dos pedidos carregados ({formatar_moeda(total_valor)}) está diferente do valor do arquivo "
                 f"({formatar_moeda(valor_informado_importacao)}). Diferença: {formatar_moeda(diferenca_valor)}."
             )
 
