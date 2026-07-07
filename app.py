@@ -1704,27 +1704,43 @@ with aba_historico:
             df_hist = df_hist.copy()
             df_hist["_data_filtro"] = df_hist.apply(obter_data_historico, axis=1)
 
-            usar_filtro_data = st.checkbox("Filtrar histórico por data")
-            if usar_filtro_data:
-                datas_validas = [d for d in df_hist["_data_filtro"].dropna().tolist()]
-                data_padrao_ini = min(datas_validas) if datas_validas else date.today()
-                data_padrao_fim = max(datas_validas) if datas_validas else date.today()
+            st.markdown("**Filtros do histórico**")
+            datas_validas = [d for d in df_hist["_data_filtro"].dropna().tolist()]
+            data_padrao_ini = min(datas_validas) if datas_validas else date.today()
+            data_padrao_fim = max(datas_validas) if datas_validas else date.today()
 
-                col_hist_data1, col_hist_data2 = st.columns([1, 1])
-                with col_hist_data1:
-                    data_hist_ini = st.date_input("Data inicial", value=data_padrao_ini, format="DD/MM/YYYY", key="hist_data_ini")
-                with col_hist_data2:
-                    data_hist_fim = st.date_input("Data final", value=data_padrao_fim, format="DD/MM/YYYY", key="hist_data_fim")
+            col_hist_1, col_hist_2, col_hist_3, col_hist_4, col_hist_5, col_hist_6 = st.columns([1, 1.2, 1, 1, 1, 1])
+            with col_hist_1:
+                filtro_pedido_hist = st.text_input("Pedido", key="hist_filtro_pedido")
+            with col_hist_2:
+                filtro_fornecedor_hist = st.text_input("Fornecedor", key="hist_filtro_fornecedor")
+            with col_hist_3:
+                filtro_depto_hist = st.text_input("Departamento", key="hist_filtro_depto")
+            with col_hist_4:
+                filtro_filial_hist = st.text_input("Filial", key="hist_filtro_filial")
+            with col_hist_5:
+                data_hist_ini = st.date_input("Data inicial", value=data_padrao_ini, format="DD/MM/YYYY", key="hist_data_ini")
+            with col_hist_6:
+                data_hist_fim = st.date_input("Data final", value=data_padrao_fim, format="DD/MM/YYYY", key="hist_data_fim")
 
-                if data_hist_ini > data_hist_fim:
-                    st.error("A data inicial não pode ser maior que a data final.")
-                    st.stop()
+            if data_hist_ini > data_hist_fim:
+                st.error("A data inicial não pode ser maior que a data final.")
+                st.stop()
 
-                df_hist = df_hist[
-                    df_hist["_data_filtro"].notna()
-                    & (df_hist["_data_filtro"] >= data_hist_ini)
-                    & (df_hist["_data_filtro"] <= data_hist_fim)
-                ].copy()
+            df_hist = df_hist[
+                df_hist["_data_filtro"].notna()
+                & (df_hist["_data_filtro"] >= data_hist_ini)
+                & (df_hist["_data_filtro"] <= data_hist_fim)
+            ].copy()
+
+            if filtro_pedido_hist:
+                df_hist = df_hist[df_hist["pedido"].astype(str).str.contains(filtro_pedido_hist, case=False, na=False)]
+            if filtro_fornecedor_hist:
+                df_hist = df_hist[df_hist["fornecedor"].astype(str).str.contains(filtro_fornecedor_hist, case=False, na=False)]
+            if filtro_depto_hist:
+                df_hist = df_hist[df_hist["departamento"].astype(str).str.contains(filtro_depto_hist, case=False, na=False)]
+            if filtro_filial_hist:
+                df_hist = df_hist[df_hist["loja"].astype(str).str.contains(filtro_filial_hist, case=False, na=False)]
 
             abas_hist = st.tabs(["Puxada", "Empurrada", "Venda Jurídica"])
             excel_hist_abas = {}
@@ -1743,7 +1759,6 @@ with aba_historico:
                         excel_hist_abas[titulo] = pd.DataFrame()
                         continue
 
-                    # Sem filtros nesta tela: o histórico fica direto por aba de demanda.
                     df_view = df_demanda_hist.copy()
 
                     df_display = montar_historico_liberados_display(df_view)
