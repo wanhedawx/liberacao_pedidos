@@ -1024,11 +1024,12 @@ def carregar_historico_liberados_neon():
                     demanda,
                     valor,
                     status_banco,
-                    cod_status_banco,
-                    primeira_carga,
-                    ultima_carga,
-                    primeira_liberacao,
-                    ultima_atualizacao
+                    COALESCE(
+                        dados_ultima_planilha ->> 'OBSERVACAO',
+                        dados_ultima_planilha ->> 'OBSERVAÇÃO',
+                        dados_ultima_planilha ->> 'MOTIVO',
+                        ''
+                    ) AS observacao
                 FROM pedidos_liberados_historico
                 ORDER BY ultima_atualizacao DESC
                 """,
@@ -1104,6 +1105,46 @@ def carregar_historico_substituicoes_neon(nome_arquivo=None):
             )
     except Exception:
         return pd.DataFrame()
+
+
+
+
+def montar_historico_liberados_display(df):
+    if df is None or df.empty:
+        return pd.DataFrame(columns=["Pedido", "Fornecedor", "Filial", "Departamento", "Tipo", "Valor", "Status", "Observação"])
+
+    df = df.copy()
+    for col in ["pedido", "fornecedor", "loja", "departamento", "demanda", "valor", "status_banco", "observacao"]:
+        if col not in df.columns:
+            df[col] = ""
+
+    display = pd.DataFrame({
+        "Pedido": df["pedido"].apply(limpar_texto),
+        "Fornecedor": df["fornecedor"].apply(limpar_texto),
+        "Filial": df["loja"].apply(limpar_texto),
+        "Departamento": df["departamento"].apply(limpar_texto),
+        "Tipo": df["demanda"].apply(lambda v: limpar_texto(v).replace("DEMANDA ", "").title().replace("Juridica", "Jurídica")),
+        "Valor": df["valor"].apply(lambda v: formatar_moeda(limpar_valor(v) or 0)),
+        "Status": df["status_banco"].apply(status_icone),
+        "Observação": df["observacao"].apply(limpar_texto),
+    })
+
+    return display
+
+
+def aplicar_filtros_historico(df, filtro_pedido="", filtro_fornecedor="", filtro_depto="", filtro_filial=""):
+    df_view = df.copy()
+
+    if filtro_pedido:
+        df_view = df_view[df_view["pedido"].astype(str).str.contains(filtro_pedido, case=False, na=False)]
+    if filtro_fornecedor:
+        df_view = df_view[df_view["fornecedor"].astype(str).str.contains(filtro_fornecedor, case=False, na=False)]
+    if filtro_depto:
+        df_view = df_view[df_view["departamento"].astype(str).str.contains(filtro_depto, case=False, na=False)]
+    if filtro_filial:
+        df_view = df_view[df_view["loja"].astype(str).str.contains(filtro_filial, case=False, na=False)]
+
+    return df_view
 
 
 # =========================================================
@@ -1551,39 +1592,49 @@ with aba_historico:
     if not ok_neon:
         st.warning("Conecte para visualizar o histórico.")
     else:
-        st.subheader("Cargas salvas")
-        df_cargas = carregar_cargas_neon()
-
-        if df_cargas.empty:
-            st.info("Nenhuma carga salva ainda.")
-        else:
-            st.dataframe(df_cargas, use_container_width=True, hide_index=True)
-
-        st.divider()
         st.subheader("Pedidos liberados mantidos no histórico")
         df_hist = carregar_historico_liberados_neon()
 
         if df_hist.empty:
             st.info("Nenhum pedido liberado salvo ainda.")
         else:
-            f1, f2, f3, f4 = st.columns(4)
-            filtro_pedido = f1.text_input("Filtrar pedido")
-            filtro_fornecedor = f2.text_input("Filtrar fornecedor")
-            filtro_depto = f3.text_input("Filtrar departamento")
-            filtro_loja = f4.text_input("Filtrar filial")
+            abas_hist = st.tabs(["Puxada", "Empurrada", "Venda Jurídica"])
+            excel_hist_abas = {}
 
-            df_view = df_hist.copy()
-            if filtro_pedido:
-                df_view = df_view[df_view["pedido"].astype(str).str.contains(filtro_pedido, case=False, na=False)]
-            if filtro_fornecedor:
-                df_view = df_view[df_view["fornecedor"].astype(str).str.contains(filtro_fornecedor, case=False, na=False)]
-            if filtro_depto:
-                df_view = df_view[df_view["departamento"].astype(str).str.contains(filtro_depto, case=False, na=False)]
-            if filtro_loja:
-                df_view = df_view[df_view["loja"].astype(str).str.contains(filtro_loja, case=False, na=False)]
+            for demanda_nome, aba in zip(DEMANDAS, abas_hist):
+                with aba:
+                    titulo = demanda_nome.replace("DEMANDA ", "").title().replace("Juridica", "Jurídica")
+                    st.markdown(f"### {titulo}")
 
-            st.dataframe(df_view, use_container_width=True, hide_index=True)
-            excel_hist = gerar_excel_abas({"Historico Liberados": df_view})
+                    df_demanda_hist = df_hist[
+                        df_hist["demanda"].astype(str).str.upper().str.strip() == demanda_nome
+                    ].copy()
+
+                    if df_demanda_hist.empty:
+                        st.info(f"Nenhum pedido liberado salvo em {titulo}.")
+                        excel_hist_abas[titulo] = pd.DataFrame()
+                        continue
+
+                    f1, f2, f3, f4 = st.columns(4)
+                    filtro_pedido = f1.text_input("Filtrar pedido", key=f"hist_pedido_{demanda_nome}")
+                    filtro_fornecedor = f2.text_input("Filtrar fornecedor", key=f"hist_fornecedor_{demanda_nome}")
+                    filtro_depto = f3.text_input("Filtrar departamento", key=f"hist_depto_{demanda_nome}")
+                    filtro_filial = f4.text_input("Filtrar filial", key=f"hist_filial_{demanda_nome}")
+
+                    df_view = aplicar_filtros_historico(
+                        df_demanda_hist,
+                        filtro_pedido=filtro_pedido,
+                        filtro_fornecedor=filtro_fornecedor,
+                        filtro_depto=filtro_depto,
+                        filtro_filial=filtro_filial,
+                    )
+
+                    df_display = montar_historico_liberados_display(df_view)
+                    excel_hist_abas[titulo] = df_display
+
+                    st.dataframe(df_display, use_container_width=True, hide_index=True)
+
+            excel_hist = gerar_excel_abas(excel_hist_abas)
             st.download_button(
                 "📥 Baixar histórico de liberados",
                 data=excel_hist,
