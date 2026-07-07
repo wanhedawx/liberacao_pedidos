@@ -244,6 +244,50 @@ def formatar_data_protheus(valor):
     return valor_txt
 
 
+def converter_para_data(valor):
+    """Converte datas do Oracle/Neon para date, aceitando YYYYMMDD, timestamp e datetime."""
+    if valor is None or pd.isna(valor):
+        return None
+
+    if isinstance(valor, datetime):
+        return valor.date()
+
+    if isinstance(valor, date):
+        return valor
+
+    valor_txt = limpar_texto(valor)
+    if not valor_txt:
+        return None
+
+    try:
+        if len(valor_txt) == 8 and valor_txt.isdigit():
+            return datetime.strptime(valor_txt, "%Y%m%d").date()
+
+        convertido = pd.to_datetime(valor_txt, errors="coerce")
+        if pd.isna(convertido):
+            return None
+        return convertido.date()
+    except Exception:
+        return None
+
+
+def formatar_data_ddmmyyyy(valor):
+    dt = converter_para_data(valor)
+    if not dt:
+        return ""
+    return dt.strftime("%d/%m/%Y")
+
+
+def obter_data_historico(row):
+    """Prioriza a data de emissão do pedido; se não existir, usa a data em que entrou no histórico."""
+    for coluna in ["data_emissao_pedido", "data_historico", "ultima_atualizacao", "primeira_liberacao"]:
+        if coluna in row.index:
+            dt = converter_para_data(row.get(coluna))
+            if dt:
+                return dt
+    return None
+
+
 def montar_tabela_arquivos_display(df_arquivos):
     if df_arquivos.empty:
         return pd.DataFrame()
@@ -1072,6 +1116,12 @@ def carregar_historico_liberados_neon():
                     valor,
                     status_banco,
                     COALESCE(
+                        dados_ultima_planilha ->> 'DATA_EMISSAO_ARQUIVO',
+                        dados_ultima_planilha ->> 'DT_EMISSAO',
+                        ''
+                    ) AS data_emissao_pedido,
+                    ultima_atualizacao AS data_historico,
+                    COALESCE(
                         dados_ultima_planilha ->> 'OBSERVACAO',
                         dados_ultima_planilha ->> 'OBSERVAÇÃO',
                         dados_ultima_planilha ->> 'MOTIVO',
@@ -1158,15 +1208,16 @@ def carregar_historico_substituicoes_neon(nome_arquivo=None):
 
 def montar_historico_liberados_display(df):
     if df is None or df.empty:
-        return pd.DataFrame(columns=["Pedido", "Fornecedor", "Filial", "Departamento", "Tipo", "Valor", "Status", "Observação"])
+        return pd.DataFrame(columns=["Pedido", "Data", "Fornecedor", "Filial", "Departamento", "Tipo", "Valor", "Status", "Observação"])
 
     df = df.copy()
-    for col in ["pedido", "fornecedor", "loja", "departamento", "demanda", "valor", "status_banco", "observacao"]:
+    for col in ["pedido", "fornecedor", "loja", "departamento", "demanda", "valor", "status_banco", "observacao", "data_emissao_pedido", "data_historico"]:
         if col not in df.columns:
             df[col] = ""
 
     display = pd.DataFrame({
         "Pedido": df["pedido"].apply(limpar_texto),
+        "Data": df.apply(lambda row: formatar_data_ddmmyyyy(obter_data_historico(row)), axis=1),
         "Fornecedor": df["fornecedor"].apply(limpar_texto),
         "Filial": df["loja"].apply(limpar_texto),
         "Departamento": df["departamento"].apply(limpar_texto),
@@ -1650,6 +1701,31 @@ with aba_historico:
         if df_hist.empty:
             st.info("Nenhum pedido liberado salvo ainda.")
         else:
+            df_hist = df_hist.copy()
+            df_hist["_data_filtro"] = df_hist.apply(obter_data_historico, axis=1)
+
+            usar_filtro_data = st.checkbox("Filtrar histórico por data")
+            if usar_filtro_data:
+                datas_validas = [d for d in df_hist["_data_filtro"].dropna().tolist()]
+                data_padrao_ini = min(datas_validas) if datas_validas else date.today()
+                data_padrao_fim = max(datas_validas) if datas_validas else date.today()
+
+                col_hist_data1, col_hist_data2 = st.columns([1, 1])
+                with col_hist_data1:
+                    data_hist_ini = st.date_input("Data inicial", value=data_padrao_ini, format="DD/MM/YYYY", key="hist_data_ini")
+                with col_hist_data2:
+                    data_hist_fim = st.date_input("Data final", value=data_padrao_fim, format="DD/MM/YYYY", key="hist_data_fim")
+
+                if data_hist_ini > data_hist_fim:
+                    st.error("A data inicial não pode ser maior que a data final.")
+                    st.stop()
+
+                df_hist = df_hist[
+                    df_hist["_data_filtro"].notna()
+                    & (df_hist["_data_filtro"] >= data_hist_ini)
+                    & (df_hist["_data_filtro"] <= data_hist_fim)
+                ].copy()
+
             abas_hist = st.tabs(["Puxada", "Empurrada", "Venda Jurídica"])
             excel_hist_abas = {}
 
@@ -1667,19 +1743,8 @@ with aba_historico:
                         excel_hist_abas[titulo] = pd.DataFrame()
                         continue
 
-                    f1, f2, f3, f4 = st.columns(4)
-                    filtro_pedido = f1.text_input("Filtrar pedido", key=f"hist_pedido_{demanda_nome}")
-                    filtro_fornecedor = f2.text_input("Filtrar fornecedor", key=f"hist_fornecedor_{demanda_nome}")
-                    filtro_depto = f3.text_input("Filtrar departamento", key=f"hist_depto_{demanda_nome}")
-                    filtro_filial = f4.text_input("Filtrar filial", key=f"hist_filial_{demanda_nome}")
-
-                    df_view = aplicar_filtros_historico(
-                        df_demanda_hist,
-                        filtro_pedido=filtro_pedido,
-                        filtro_fornecedor=filtro_fornecedor,
-                        filtro_depto=filtro_depto,
-                        filtro_filial=filtro_filial,
-                    )
+                    # Sem filtros nesta tela: o histórico fica direto por aba de demanda.
+                    df_view = df_demanda_hist.copy()
 
                     df_display = montar_historico_liberados_display(df_view)
                     excel_hist_abas[titulo] = df_display
