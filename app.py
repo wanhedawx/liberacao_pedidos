@@ -1502,7 +1502,7 @@ with aba_consulta:
                         }
 
                         if salvar_substituicao_neon(dados_salvar):
-                            st.success("Substituição salva no histórico do Neon.")
+                            st.success("Substituição salva no histórico.")
 
             st.divider()
             st.subheader("Histórico de substituições deste arquivo")
@@ -1526,7 +1526,7 @@ with aba_consulta:
             )
 
         with col_salvar:
-            if st.button("💾 Salvar importação no Neon", type="primary", use_container_width=True):
+            if st.button("💾 Salvar importação", type="primary", use_container_width=True):
                 if not ok_neon:
                     st.error("Neon não conectado. Verifique os Secrets.")
                 else:
@@ -1544,14 +1544,14 @@ with aba_consulta:
                         valor_informado=st.session_state.get("valor_informado_importacao", None),
                     )
                     if sucesso:
-                        st.success("Importação salva no Neon, removidos registrados e histórico de liberados atualizado.")
+                        st.success("Importação salva com sucesso.")
 
 
 with aba_historico:
     if not ok_neon:
-        st.warning("Conecte o Neon para visualizar o histórico.")
+        st.warning("Conecte para visualizar o histórico.")
     else:
-        st.subheader("Cargas salvas no Neon")
+        st.subheader("Cargas salvas")
         df_cargas = carregar_cargas_neon()
 
         if df_cargas.empty:
