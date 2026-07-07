@@ -1755,7 +1755,7 @@ with aba_historico:
 
         st.divider()
         st.markdown("### Registrar substituição")
-        st.caption("Use esta área para registrar pedido antigo e pedido novo, mesmo sem estar na tela de importação.")
+        st.caption("Use esta área para registrar uma substituição")
 
         df_base_sub = montar_base_substituicao_historico(df_hist_base if 'df_hist_base' in locals() else df_hist)
 
@@ -1764,7 +1764,7 @@ with aba_historico:
         else:
             fornecedores_sub_hist = lista_fornecedores(df_base_sub)
             fornecedor_sub_hist_sel = st.selectbox(
-                "Filtrar fornecedor para escolher o pedido antigo",
+                "Escolha o forncedor",
                 options=fornecedores_sub_hist,
                 key="hist_sub_filtro_fornecedor",
             )
@@ -1791,7 +1791,7 @@ with aba_historico:
                 with col_sub2:
                     motivo_sub_hist = st.selectbox(
                         "Motivo fixo",
-                        options=["ERRO DE CADASTRO", "ERRO DE TABELA"],
+                        options=["ERRO DE CADASTRO", "ERRO DE TABELA", "ERRO DE FAT. FORNECEDOR","FAT. EM DUPLICIDADE"],
                         key="hist_sub_motivo",
                     )
 
