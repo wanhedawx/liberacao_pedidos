@@ -199,6 +199,27 @@ def valor_loja_naomisto_total(linha_arquivo):
     return 0.0
 
 
+def valor_pedido_tipo_fornecedor(grupo):
+    """
+    Calcula o valor do pedido para exibição/histórico.
+
+    Regra atual: quando existir linha TIPO_FORNECEDOR no pedido,
+    o valor do pedido deve ser a soma somente das linhas TIPO_FORNECEDOR.
+    Se não existir TIPO no retorno da API, usa a soma normal como fallback.
+    """
+    if grupo is None or grupo.empty or COLUNA_VALOR not in grupo.columns:
+        return 0.0
+
+    base = grupo.copy()
+    if "TIPO" in base.columns:
+        tipo = base["TIPO"].astype(str).str.strip().str.upper()
+        base_fornecedor = base[tipo == "TIPO_FORNECEDOR"].copy()
+        if not base_fornecedor.empty:
+            base = base_fornecedor
+
+    return float(sum((limpar_valor(v) or 0) for v in base[COLUNA_VALOR]))
+
+
 def qtd_loja_naomisto_total(linha_arquivo):
     for coluna in ["QTD_PEDIDOS", COLUNA_QTD_LOJA_NAOMISTO, "QTD_PEDIDOS_TIPO2"]:
         if coluna in linha_arquivo.index:
@@ -339,7 +360,7 @@ def montar_tabela_planilha(df):
         return pd.DataFrame(columns=["DEPARTAMENTO", "FILIAL", "FORNECEDOR", "PEDIDO", "VALOR", "OBSERVAÇÃO", "Status"])
 
     df = df.copy()
-    for col in [COLUNA_DEPARTAMENTO, COLUNA_LOJA, COLUNA_FORNECEDOR, COLUNA_PEDIDO, COLUNA_VALOR, COLUNA_OBSERVACAO, "MOTIVO", "STATUS_BANCO"]:
+    for col in [COLUNA_DEPARTAMENTO, COLUNA_LOJA, COLUNA_FORNECEDOR, COLUNA_PEDIDO, COLUNA_VALOR, COLUNA_OBSERVACAO, "MOTIVO", "STATUS_BANCO", "TIPO"]:
         if col not in df.columns:
             df[col] = ""
 
@@ -352,23 +373,25 @@ def montar_tabela_planilha(df):
         valores = [limpar_texto(v) for v in serie if limpar_texto(v)]
         return "; ".join(sorted(set(valores)))
 
-    tabela = (
-        df.groupby([COLUNA_DEPARTAMENTO, COLUNA_LOJA, COLUNA_FORNECEDOR, COLUNA_PEDIDO], dropna=False)
-        .agg(
-            VALOR=(COLUNA_VALOR, lambda x: sum((limpar_valor(v) or 0) for v in x)),
-            OBSERVACAO=(COLUNA_OBSERVACAO, juntar_unicos),
-            Status=("STATUS_BANCO", lambda x: "LIBERADO" if "LIBERADO" in set(x) else "BLOQUEADO"),
-        )
-        .reset_index()
-    )
+    linhas = []
+    for chaves, grupo in df.groupby([COLUNA_DEPARTAMENTO, COLUNA_LOJA, COLUNA_FORNECEDOR, COLUNA_PEDIDO], dropna=False):
+        departamento, filial, fornecedor, pedido = chaves
+        status = "LIBERADO" if "LIBERADO" in set(grupo["STATUS_BANCO"]) else "BLOQUEADO"
+        linhas.append({
+            "DEPARTAMENTO": departamento,
+            "FILIAL": filial,
+            "FORNECEDOR": fornecedor,
+            "PEDIDO": pedido,
+            # Só o VALOR usa a regra do TIPO_FORNECEDOR.
+            "VALOR": valor_pedido_tipo_fornecedor(grupo),
+            "OBSERVAÇÃO": juntar_unicos(grupo[COLUNA_OBSERVACAO]),
+            "Status": status,
+        })
 
-    tabela = tabela.rename(columns={
-        COLUNA_DEPARTAMENTO: "DEPARTAMENTO",
-        COLUNA_LOJA: "FILIAL",
-        COLUNA_FORNECEDOR: "FORNECEDOR",
-        COLUNA_PEDIDO: "PEDIDO",
-        "OBSERVACAO": "OBSERVAÇÃO",
-    })
+    tabela = pd.DataFrame(linhas)
+    if tabela.empty:
+        return pd.DataFrame(columns=["DEPARTAMENTO", "FILIAL", "FORNECEDOR", "PEDIDO", "VALOR", "OBSERVAÇÃO", "Status"])
+
     tabela["VALOR"] = tabela["VALOR"].apply(formatar_moeda)
     tabela = tabela[["DEPARTAMENTO", "FILIAL", "FORNECEDOR", "PEDIDO", "VALOR", "OBSERVAÇÃO", "Status"]]
     return tabela
@@ -380,26 +403,27 @@ def montar_resumo_departamento(df):
         return pd.DataFrame(columns=["Departamento", "Pedidos", "Liberados", "Bloqueados", "Valor Total"])
 
     df = df.copy()
-    for col in [COLUNA_DEPARTAMENTO, COLUNA_PEDIDO, COLUNA_VALOR, "STATUS_BANCO"]:
+    for col in [COLUNA_DEPARTAMENTO, COLUNA_LOJA, COLUNA_FORNECEDOR, COLUNA_PEDIDO, COLUNA_VALOR, "STATUS_BANCO", "TIPO"]:
         if col not in df.columns:
             df[col] = ""
 
     df[COLUNA_DEPARTAMENTO] = df[COLUNA_DEPARTAMENTO].apply(limpar_texto).replace("", "SEM DEPARTAMENTO")
 
-    resumo = (
-        df.groupby(COLUNA_DEPARTAMENTO, dropna=False)
-        .agg(
-            Pedidos=(COLUNA_PEDIDO, "nunique"),
-            Liberados=(COLUNA_PEDIDO, lambda x: df.loc[x.index][df.loc[x.index, "STATUS_BANCO"] == "LIBERADO"][COLUNA_PEDIDO].nunique()),
-            Bloqueados=(COLUNA_PEDIDO, lambda x: df.loc[x.index][df.loc[x.index, "STATUS_BANCO"] == "BLOQUEADO"][COLUNA_PEDIDO].nunique()),
-            Valor=(COLUNA_VALOR, lambda x: sum((limpar_valor(v) or 0) for v in x)),
-        )
-        .reset_index()
-        .rename(columns={COLUNA_DEPARTAMENTO: "Departamento"})
-    )
+    linhas = []
+    for departamento, grupo_depto in df.groupby(COLUNA_DEPARTAMENTO, dropna=False):
+        valor_total = 0.0
+        for _, grupo_pedido in grupo_depto.groupby([COLUNA_LOJA, COLUNA_FORNECEDOR, COLUNA_PEDIDO], dropna=False):
+            valor_total += valor_pedido_tipo_fornecedor(grupo_pedido)
 
-    resumo["Valor Total"] = resumo["Valor"].apply(formatar_moeda)
-    resumo = resumo[["Departamento", "Pedidos", "Liberados", "Bloqueados", "Valor Total"]]
+        linhas.append({
+            "Departamento": departamento,
+            "Pedidos": grupo_depto[COLUNA_PEDIDO].nunique(),
+            "Liberados": grupo_depto.loc[grupo_depto["STATUS_BANCO"] == "LIBERADO", COLUNA_PEDIDO].nunique(),
+            "Bloqueados": grupo_depto.loc[grupo_depto["STATUS_BANCO"] == "BLOQUEADO", COLUNA_PEDIDO].nunique(),
+            "Valor Total": formatar_moeda(valor_total),
+        })
+
+    resumo = pd.DataFrame(linhas)
     return resumo.sort_values("Departamento").reset_index(drop=True)
 
 
@@ -784,7 +808,12 @@ def salvar_carga_no_neon(
     pedidos_liberados = df_final.loc[df_final["STATUS_BANCO"] == "LIBERADO", COLUNA_PEDIDO].nunique() if not df_final.empty else 0
     qtd_liberados = int(pedidos_liberados)
     qtd_nao_liberados = max(qtd_pedidos - qtd_liberados, 0)
-    valor_total_calculado = float(df_final[COLUNA_VALOR].fillna(0).sum()) if COLUNA_VALOR in df_final.columns and not df_final.empty else 0.0
+    if df_final is not None and not df_final.empty and COLUNA_VALOR in df_final.columns:
+        valor_total_calculado = 0.0
+        for _, grupo_pedido in df_final.groupby([COLUNA_LOJA, COLUNA_FORNECEDOR, COLUNA_PEDIDO], dropna=False):
+            valor_total_calculado += valor_pedido_tipo_fornecedor(grupo_pedido)
+    else:
+        valor_total_calculado = 0.0
     valor_informado_num = limpar_valor(valor_informado)
     diferenca_valor = None if valor_informado_num is None else float(valor_total_calculado - valor_informado_num)
 
@@ -860,7 +889,24 @@ def salvar_carga_no_neon(
                     },
                 )
 
-                if status_banco == "LIBERADO":
+
+
+            # Histórico de liberados: salva 1 linha por pedido/filial.
+            # Só o VALOR usa a regra do TIPO_FORNECEDOR; os demais campos continuam normais.
+            df_liberados_hist = df_final[df_final["STATUS_BANCO"] == "LIBERADO"].copy()
+            if not df_liberados_hist.empty:
+                for (pedido_hist, loja_hist), grupo_hist in df_liberados_hist.groupby([COLUNA_PEDIDO, COLUNA_LOJA], dropna=False):
+                    primeira_linha = grupo_hist.iloc[0]
+                    pedido = limpar_texto(pedido_hist)
+                    fornecedor = limpar_texto(primeira_linha.get(COLUNA_FORNECEDOR))
+                    loja = limpar_texto(loja_hist) or "GERAL"
+                    valor = valor_pedido_tipo_fornecedor(grupo_hist)
+                    depto_row = limpar_texto(primeira_linha.get(COLUNA_DEPARTAMENTO)) or departamento
+                    status_banco = limpar_texto(primeira_linha.get("STATUS_BANCO"))
+                    cod_status_banco = limpar_texto(primeira_linha.get("COD_STATUS_BANCO"))
+                    demanda = limpar_texto(primeira_linha.get(COLUNA_DEMANDA))
+                    dados = row_json(primeira_linha)
+
                     conn.execute(
                         text(
                             """
@@ -896,6 +942,7 @@ def salvar_carga_no_neon(
                             "demanda": demanda,
                         },
                     )
+
 
             if df_removidos is not None and not df_removidos.empty:
                 for _, row in df_removidos.iterrows():
@@ -1421,7 +1468,12 @@ with aba_consulta:
         total_liberados = df_final.loc[df_final["STATUS_BANCO"] == "LIBERADO", COLUNA_PEDIDO].nunique() if "STATUS_BANCO" in df_final.columns else 0
         total_bloqueados = df_final.loc[df_final["STATUS_BANCO"] == "BLOQUEADO", COLUNA_PEDIDO].nunique() if "STATUS_BANCO" in df_final.columns else 0
         total_removidos = df_removidos[COLUNA_PEDIDO].nunique() if not df_removidos.empty and COLUNA_PEDIDO in df_removidos.columns else 0
-        total_valor = df_final[COLUNA_VALOR].fillna(0).sum() if COLUNA_VALOR in df_final.columns else 0
+        if COLUNA_VALOR in df_final.columns and not df_final.empty:
+            total_valor = 0.0
+            for _, grupo_pedido in df_final.groupby([COLUNA_LOJA, COLUNA_FORNECEDOR, COLUNA_PEDIDO], dropna=False):
+                total_valor += valor_pedido_tipo_fornecedor(grupo_pedido)
+        else:
+            total_valor = 0.0
 
         m1, m2, m3, m4, m5 = st.columns(5)
         m1.metric("Pedidos", int(total_pedidos))
