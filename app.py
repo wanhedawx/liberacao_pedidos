@@ -1312,11 +1312,13 @@ ok_neon, msg_neon = testar_conexao_neon()
 ok_api, msg_api = testar_conexao_api()
 
 with st.sidebar:
+    st.markdown("### 📦 Liberação")
     usuario_importacao = st.text_input("Usuário", value="Vitoria")
 
     if ok_neon:
         criar_tabelas_neon()
 
+    # Mostra conexões apenas quando houver problema, para não poluir a lateral.
     if not ok_neon or not ok_api:
         st.divider()
         st.header("Conexões")
@@ -1328,6 +1330,64 @@ with st.sidebar:
         if not ok_api:
             st.error("API da empresa não conectada")
             st.caption(msg_api)
+
+    st.divider()
+    st.markdown("### Resumo atual")
+
+    df_sidebar = preparar_df_pedidos(st.session_state.get("df_pedidos_empresa", pd.DataFrame()))
+
+    if not df_sidebar.empty:
+        pedido_sidebar = df_sidebar[COLUNA_PEDIDO].nunique() if COLUNA_PEDIDO in df_sidebar.columns else len(df_sidebar)
+        liberado_sidebar = (
+            df_sidebar.loc[df_sidebar["STATUS_BANCO"] == "LIBERADO", COLUNA_PEDIDO].nunique()
+            if "STATUS_BANCO" in df_sidebar.columns and COLUNA_PEDIDO in df_sidebar.columns
+            else 0
+        )
+        bloqueado_sidebar = (
+            df_sidebar.loc[df_sidebar["STATUS_BANCO"] == "BLOQUEADO", COLUNA_PEDIDO].nunique()
+            if "STATUS_BANCO" in df_sidebar.columns and COLUNA_PEDIDO in df_sidebar.columns
+            else 0
+        )
+
+        valor_sidebar = 0.0
+        if COLUNA_VALOR in df_sidebar.columns:
+            for _, grupo_pedido_sidebar in df_sidebar.groupby([COLUNA_LOJA, COLUNA_FORNECEDOR, COLUNA_PEDIDO], dropna=False):
+                valor_sidebar += valor_pedido_tipo_fornecedor(grupo_pedido_sidebar)
+
+        st.caption("Importação carregada")
+        st.metric("Pedidos", int(pedido_sidebar))
+        st.metric("Liberados", int(liberado_sidebar))
+        st.metric("Bloqueados", int(bloqueado_sidebar))
+        st.metric("Valor Total", formatar_moeda(valor_sidebar))
+
+        demanda_sidebar = limpar_texto(st.session_state.get("tipo_demanda_importacao", ""))
+        arquivo_sidebar = limpar_texto(st.session_state.get("nome_arquivo_selecionado", ""))
+
+        if demanda_sidebar:
+            st.caption(f"Tipo: {demanda_sidebar.replace('DEMANDA ', '').title().replace('Juridica', 'Jurídica')}")
+        if arquivo_sidebar:
+            with st.expander("Arquivo(s)", expanded=False):
+                st.write(arquivo_sidebar)
+    else:
+        st.caption("Nenhuma importação carregada ainda.")
+        st.markdown(
+            """
+            **Fluxo rápido**
+
+            1. Busque os arquivos.  
+            2. Escolha um ou mais arquivos.  
+            3. Classifique a demanda.  
+            4. Remova pedidos errados, se precisar.  
+            5. Salve no Neon.
+            """
+        )
+
+    st.divider()
+    with st.expander("Atalhos", expanded=False):
+        st.caption("Link da tela na rede")
+        st.code("http://192.168.129.8:8501", language="text")
+        st.caption("API local")
+        st.code("http://localhost:8000", language="text")
 
 aba_consulta, aba_historico, aba_config = st.tabs([
     "🔎 Consultar banco da empresa",
