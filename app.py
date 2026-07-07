@@ -1754,8 +1754,6 @@ with aba_historico:
             )
 
         st.divider()
-        st.subheader("Histórico geral de substituições")
-
         st.markdown("### Registrar substituição")
         st.caption("Use esta área para registrar pedido antigo e pedido novo, mesmo sem estar na tela de importação.")
 
