@@ -1644,17 +1644,24 @@ with aba_consulta:
     if not df_arquivos.empty:
         st.subheader("2. Escolha o(s) arquivo(s) importado(s)")
 
-        tabela_arquivos = montar_tabela_arquivos_display(df_arquivos)
+        df_arquivos_opcoes = df_arquivos.reset_index(drop=True).copy()
+        tabela_arquivos = montar_tabela_arquivos_display(df_arquivos_opcoes)
         st.dataframe(tabela_arquivos, use_container_width=True, hide_index=True)
 
-        df_arquivos_opcoes = df_arquivos.reset_index(drop=True).copy()
+        # Usa exatamente a mesma data exibida na tabela também no multiselect.
+        # Assim evita aparecer 06/10/2026 no seletor quando a tabela mostra 10/06/2026.
+        if not tabela_arquivos.empty and "Data de emissão" in tabela_arquivos.columns:
+            df_arquivos_opcoes["DATA_EMISSAO_DISPLAY"] = tabela_arquivos["Data de emissão"].astype(str).tolist()
+        else:
+            df_arquivos_opcoes["DATA_EMISSAO_DISPLAY"] = df_arquivos_opcoes.get("DATA_EMISSAO", "").apply(formatar_data_protheus)
+
         opcoes_arquivos = []
         mapa_opcoes_arquivos = {}
 
         for idx, row in df_arquivos_opcoes.iterrows():
             filial_label = limpar_texto(row.get("FILIAL")) or "SEM FILIAL"
             nome_label = limpar_texto(row.get(COLUNA_NOME_ARQUIVO))
-            data_label = formatar_data_protheus(row.get("DATA_EMISSAO")) or "SEM DATA"
+            data_label = limpar_texto(row.get("DATA_EMISSAO_DISPLAY")) or "SEM DATA"
             valor_label = formatar_moeda(valor_loja_naomisto_total(row))
             label = f"{filial_label} | {nome_label} | {data_label} | {valor_label}"
             opcoes_arquivos.append(label)
@@ -1685,16 +1692,19 @@ with aba_consulta:
             valor_total_arquivos = float(sum(valor_loja_naomisto_total(row) for _, row in df_linhas_selecionadas.iterrows()))
 
             datas_raw = []
+            datas_display = []
             for _, row in df_linhas_selecionadas.iterrows():
                 raw = limpar_texto(row.get("DATA_EMISSAO"))
+                display = limpar_texto(row.get("DATA_EMISSAO_DISPLAY")) or formatar_data_protheus(raw)
                 if raw and raw not in datas_raw:
                     datas_raw.append(raw)
+                if display and display not in datas_display:
+                    datas_display.append(display)
 
-            datas_raw_ordenadas = sorted(datas_raw)
-            if len(datas_raw_ordenadas) == 1:
-                data_emissao_label = formatar_data_protheus(datas_raw_ordenadas[0])
-            elif len(datas_raw_ordenadas) > 1:
-                data_emissao_label = f"{formatar_data_protheus(datas_raw_ordenadas[0])} a {formatar_data_protheus(datas_raw_ordenadas[-1])}"
+            if len(datas_display) == 1:
+                data_emissao_label = datas_display[0]
+            elif len(datas_display) > 1:
+                data_emissao_label = f"{datas_display[0]} a {datas_display[-1]}"
             else:
                 data_emissao_label = "-"
 
@@ -2016,102 +2026,151 @@ with aba_historico:
         df_base_sub = montar_base_substituicao_historico(df_hist_base if 'df_hist_base' in locals() else df_hist)
 
         if df_base_sub.empty:
-            st.info("Não há pedidos no histórico para selecionar como pedido antigo.")
+            st.info("Não há pedidos no histórico para usar como pedido antigo.")
         else:
-            fornecedores_sub_hist = lista_fornecedores(df_base_sub)
-            fornecedor_sub_hist_sel = st.selectbox(
-                "Escolha o forncedor",
-                options=fornecedores_sub_hist,
-                key="hist_sub_filtro_fornecedor",
+            st.caption("Informe o código do fornecedor, o pedido antigo e o pedido novo. Não precisa selecionar em lista grande.")
+
+            col_fornecedor_cod, col_pedido_antigo_cod = st.columns([1, 1])
+            with col_fornecedor_cod:
+                codigo_fornecedor_sub_hist = st.text_input(
+                    "Código do fornecedor",
+                    placeholder="Ex: 000603 ou 01/000603",
+                    key="hist_sub_codigo_fornecedor",
+                )
+            with col_pedido_antigo_cod:
+                pedido_antigo_hist = st.text_input(
+                    "Pedido antigo",
+                    placeholder="Digite somente o código do pedido antigo",
+                    key="hist_sub_pedido_antigo_codigo",
+                )
+
+            codigo_fornecedor_sub_hist = limpar_texto(codigo_fornecedor_sub_hist)
+            pedido_antigo_hist = limpar_texto(pedido_antigo_hist).upper()
+
+            df_antigos_filtrados = df_base_sub.copy()
+
+            if codigo_fornecedor_sub_hist:
+                df_antigos_filtrados = df_antigos_filtrados[
+                    df_antigos_filtrados[COLUNA_FORNECEDOR].astype(str).str.contains(
+                        codigo_fornecedor_sub_hist,
+                        case=False,
+                        na=False,
+                    )
+                ].copy()
+
+            if pedido_antigo_hist:
+                df_antigos_filtrados = df_antigos_filtrados[
+                    df_antigos_filtrados[COLUNA_PEDIDO].astype(str).str.upper().str.strip() == pedido_antigo_hist
+                ].copy()
+
+            if codigo_fornecedor_sub_hist or pedido_antigo_hist:
+                if df_antigos_filtrados.empty:
+                    st.warning("Nenhum pedido antigo encontrado com esse fornecedor/pedido no histórico.")
+                else:
+                    st.markdown("**Pedido antigo encontrado**")
+                    colunas_preview_antigo = [
+                        COLUNA_PEDIDO,
+                        COLUNA_FORNECEDOR,
+                        COLUNA_LOJA,
+                        COLUNA_DEPARTAMENTO,
+                        COLUNA_VALOR,
+                        "STATUS_BANCO",
+                        COLUNA_OBSERVACAO,
+                    ]
+                    colunas_preview_antigo = [c for c in colunas_preview_antigo if c in df_antigos_filtrados.columns]
+                    df_preview_antigo = df_antigos_filtrados[colunas_preview_antigo].drop_duplicates().copy()
+                    if COLUNA_VALOR in df_preview_antigo.columns:
+                        df_preview_antigo[COLUNA_VALOR] = df_preview_antigo[COLUNA_VALOR].apply(lambda v: formatar_moeda(limpar_valor(v) or 0))
+                    if "STATUS_BANCO" in df_preview_antigo.columns:
+                        df_preview_antigo["STATUS"] = df_preview_antigo["STATUS_BANCO"].apply(status_icone)
+                        df_preview_antigo = df_preview_antigo.drop(columns=["STATUS_BANCO"])
+                    df_preview_antigo = df_preview_antigo.rename(columns={
+                        COLUNA_PEDIDO: "Pedido",
+                        COLUNA_FORNECEDOR: "Fornecedor",
+                        COLUNA_LOJA: "Filial",
+                        COLUNA_DEPARTAMENTO: "Departamento",
+                        COLUNA_VALOR: "Valor",
+                        COLUNA_OBSERVACAO: "Observação",
+                    })
+                    st.dataframe(df_preview_antigo, use_container_width=True, hide_index=True)
+
+            col_sub1, col_sub2 = st.columns([1, 1])
+            with col_sub1:
+                pedido_novo_hist = st.text_input(
+                    "Pedido novo",
+                    placeholder="Digite somente o código do pedido novo",
+                    key="hist_sub_pedido_novo",
+                )
+            with col_sub2:
+                motivo_sub_hist = st.selectbox(
+                    "Motivo fixo",
+                    options=["ERRO DE CADASTRO", "ERRO DE TABELA", "ERRO DE FAT. FORNECEDOR", "FAT. EM DUPLICIDADE"],
+                    key="hist_sub_motivo",
+                )
+
+            pedido_novo_hist = limpar_texto(pedido_novo_hist).upper()
+
+            observacao_sub_hist = st.text_area(
+                "Observação",
+                placeholder="Digite a observação da substituição",
+                key="hist_sub_observacao",
             )
-            filtro_fornecedor_sub_hist = "" if fornecedor_sub_hist_sel == "Todos" else fornecedor_sub_hist_sel
-            mapa_sub_hist, opcoes_sub_hist = montar_opcoes_pedido(df_base_sub, filtro_fornecedor_sub_hist)
 
-            if not opcoes_sub_hist:
-                st.info("Nenhum pedido encontrado para substituição com esse fornecedor.")
-            else:
-                label_pedido_antigo_hist = st.selectbox(
-                    "Qual pedido você precisa substituir?",
-                    options=opcoes_sub_hist,
-                    key="hist_sub_pedido_antigo",
-                )
-                pedido_antigo_hist = mapa_sub_hist.get(label_pedido_antigo_hist, "")
+            if pedido_novo_hist and st.button("🔎 Consultar status do novo pedido", key="hist_sub_consultar_status"):
+                df_status_novo_hist = consultar_status_pedidos_api([pedido_novo_hist])
+                st.session_state["df_status_pedido_novo_hist"] = df_status_novo_hist
 
-                col_sub1, col_sub2 = st.columns([1, 1])
-                with col_sub1:
-                    pedido_novo_hist = st.text_input(
-                        "Novo pedido",
-                        placeholder="Digite o novo número do pedido",
-                        key="hist_sub_pedido_novo",
-                    )
-                with col_sub2:
-                    motivo_sub_hist = st.selectbox(
-                        "Motivo fixo",
-                        options=["ERRO DE CADASTRO", "ERRO DE TABELA", "ERRO DE FAT. FORNECEDOR","FAT. EM DUPLICIDADE"],
-                        key="hist_sub_motivo",
-                    )
+            df_status_novo_hist = st.session_state.get("df_status_pedido_novo_hist", pd.DataFrame())
+            if pedido_novo_hist and not df_status_novo_hist.empty:
+                st.write("Status do pedido novo:")
+                df_status_display = df_status_novo_hist.copy()
+                if "STATUS_BANCO" in df_status_display.columns:
+                    df_status_display["STATUS"] = df_status_display["STATUS_BANCO"].apply(status_icone)
+                st.dataframe(df_status_display, use_container_width=True, hide_index=True)
 
-                observacao_sub_hist = st.text_area(
-                    "Observação",
-                    placeholder="Digite a observação da substituição",
-                    key="hist_sub_observacao",
-                )
+            if st.button("💾 Salvar substituição", type="primary", key="hist_sub_salvar"):
+                if not ok_neon:
+                    st.error("Neon não conectado. Verifique os Secrets.")
+                elif not pedido_antigo_hist:
+                    st.error("Informe o pedido antigo.")
+                elif not pedido_novo_hist:
+                    st.error("Informe o pedido novo.")
+                elif df_antigos_filtrados.empty:
+                    st.error("Pedido antigo não encontrado no histórico. Confira o código do fornecedor e o código do pedido antigo.")
+                else:
+                    row_antigo_hist = df_antigos_filtrados.iloc[0]
 
-                if pedido_novo_hist and st.button("🔎 Consultar status do novo pedido", key="hist_sub_consultar_status"):
                     df_status_novo_hist = consultar_status_pedidos_api([pedido_novo_hist])
-                    st.session_state["df_status_pedido_novo_hist"] = df_status_novo_hist
+                    row_novo_hist = df_status_novo_hist.iloc[0] if not df_status_novo_hist.empty else pd.Series(dtype="object")
 
-                df_status_novo_hist = st.session_state.get("df_status_pedido_novo_hist", pd.DataFrame())
-                if pedido_novo_hist and not df_status_novo_hist.empty:
-                    st.write("Status do pedido novo:")
-                    df_status_display = df_status_novo_hist.copy()
-                    if "STATUS_BANCO" in df_status_display.columns:
-                        df_status_display["STATUS"] = df_status_display["STATUS_BANCO"].apply(status_icone)
-                    st.dataframe(df_status_display, use_container_width=True, hide_index=True)
+                    demanda_antiga = limpar_texto(row_antigo_hist.get(COLUNA_DEMANDA, ""))
+                    observacao_antiga = limpar_texto(row_antigo_hist.get(COLUNA_OBSERVACAO, ""))
+                    nome_carga_sub = observacao_antiga or f"Substituição {pedido_antigo_hist} -> {pedido_novo_hist}"
 
-                if st.button("💾 Salvar substituição", type="primary", key="hist_sub_salvar"):
-                    if not ok_neon:
-                        st.error("Neon não conectado. Verifique os Secrets.")
-                    elif not pedido_novo_hist:
-                        st.error("Informe o novo pedido.")
-                    elif not pedido_antigo_hist:
-                        st.error("Selecione o pedido antigo.")
-                    else:
-                        df_antigo_hist = df_base_sub[df_base_sub[COLUNA_PEDIDO] == pedido_antigo_hist].copy()
-                        row_antigo_hist = df_antigo_hist.iloc[0] if not df_antigo_hist.empty else pd.Series(dtype="object")
+                    dados_salvar = {
+                        "nome_carga": nome_carga_sub,
+                        "nome_arquivo": observacao_antiga,
+                        "usuario_registro": usuario_importacao,
+                        "analista": "",
+                        "departamento": limpar_texto(row_antigo_hist.get(COLUNA_DEPARTAMENTO, "")),
+                        "pedido_antigo": pedido_antigo_hist,
+                        "fornecedor_antigo": limpar_texto(row_antigo_hist.get(COLUNA_FORNECEDOR, "")),
+                        "loja_antiga": limpar_texto(row_antigo_hist.get(COLUNA_LOJA, "")),
+                        "status_antigo": limpar_texto(row_antigo_hist.get("STATUS_BANCO", "")),
+                        "cod_status_antigo": limpar_texto(row_antigo_hist.get("COD_STATUS_BANCO", "")),
+                        "pedido_novo": pedido_novo_hist,
+                        "fornecedor_novo": limpar_texto(row_novo_hist.get("FORNECEDOR", "")),
+                        "loja_nova": limpar_texto(row_novo_hist.get("FILIAL", "")),
+                        "status_novo": limpar_texto(row_novo_hist.get("STATUS_BANCO", "NÃO ENCONTRADO")),
+                        "cod_status_novo": limpar_texto(row_novo_hist.get("COD_STATUS_BANCO", "")),
+                        "motivo": motivo_sub_hist,
+                        "observacao": observacao_sub_hist,
+                        "dados_pedido_antigo": row_json(row_antigo_hist) if not row_antigo_hist.empty else "{}",
+                        "dados_pedido_novo": row_json(row_novo_hist) if not row_novo_hist.empty else "{}",
+                    }
 
-                        df_status_novo_hist = consultar_status_pedidos_api([pedido_novo_hist])
-                        row_novo_hist = df_status_novo_hist.iloc[0] if not df_status_novo_hist.empty else pd.Series(dtype="object")
-
-                        demanda_antiga = limpar_texto(row_antigo_hist.get(COLUNA_DEMANDA, ""))
-                        observacao_antiga = limpar_texto(row_antigo_hist.get(COLUNA_OBSERVACAO, ""))
-                        nome_carga_sub = observacao_antiga or f"Substituição {pedido_antigo_hist} -> {pedido_novo_hist}"
-
-                        dados_salvar = {
-                            "nome_carga": nome_carga_sub,
-                            "nome_arquivo": observacao_antiga,
-                            "usuario_registro": usuario_importacao,
-                            "analista": "",
-                            "departamento": limpar_texto(row_antigo_hist.get(COLUNA_DEPARTAMENTO, "")),
-                            "pedido_antigo": pedido_antigo_hist,
-                            "fornecedor_antigo": limpar_texto(row_antigo_hist.get(COLUNA_FORNECEDOR, "")),
-                            "loja_antiga": limpar_texto(row_antigo_hist.get(COLUNA_LOJA, "")),
-                            "status_antigo": limpar_texto(row_antigo_hist.get("STATUS_BANCO", "")),
-                            "cod_status_antigo": limpar_texto(row_antigo_hist.get("COD_STATUS_BANCO", "")),
-                            "pedido_novo": limpar_texto(pedido_novo_hist),
-                            "fornecedor_novo": limpar_texto(row_novo_hist.get("FORNECEDOR", "")),
-                            "loja_nova": limpar_texto(row_novo_hist.get("FILIAL", "")),
-                            "status_novo": limpar_texto(row_novo_hist.get("STATUS_BANCO", "NÃO ENCONTRADO")),
-                            "cod_status_novo": limpar_texto(row_novo_hist.get("COD_STATUS_BANCO", "")),
-                            "motivo": motivo_sub_hist,
-                            "observacao": observacao_sub_hist,
-                            "dados_pedido_antigo": row_json(row_antigo_hist) if not row_antigo_hist.empty else "{}",
-                            "dados_pedido_novo": row_json(row_novo_hist) if not row_novo_hist.empty else "{}",
-                        }
-
-                        if salvar_substituicao_neon(dados_salvar):
-                            st.success("Substituição salva no histórico.")
-
+                    if salvar_substituicao_neon(dados_salvar):
+                        st.success("Substituição salva no histórico.")
         st.divider()
         st.markdown("### Substituições registradas")
         df_subs = carregar_historico_substituicoes_neon()
