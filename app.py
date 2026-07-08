@@ -1,4 +1,5 @@
 import json
+import hashlib
 from datetime import date, datetime, timedelta
 from io import BytesIO
 
@@ -276,6 +277,18 @@ def formatar_data_ddmmyyyy(valor):
     if not dt:
         return ""
     return dt.strftime("%d/%m/%Y")
+
+
+def formatar_data_hora_ddmmyyyy(valor):
+    if valor is None or pd.isna(valor):
+        return ""
+    try:
+        dt = pd.to_datetime(valor, errors="coerce")
+        if pd.isna(dt):
+            return ""
+        return dt.strftime("%d/%m/%Y %H:%M")
+    except Exception:
+        return limpar_texto(valor)
 
 
 def obter_data_historico(row):
@@ -619,6 +632,18 @@ def criar_tabelas_neon():
         data_registro TIMESTAMP DEFAULT NOW()
     );
 
+    CREATE TABLE IF NOT EXISTS usuarios_sistema (
+        id BIGSERIAL PRIMARY KEY,
+        usuario TEXT NOT NULL UNIQUE,
+        senha_hash TEXT NOT NULL,
+        nome TEXT NOT NULL,
+        perfil TEXT NOT NULL DEFAULT 'ANALISTA',
+        analista TEXT,
+        ativo BOOLEAN DEFAULT TRUE,
+        criado_em TIMESTAMP DEFAULT NOW(),
+        atualizado_em TIMESTAMP DEFAULT NOW()
+    );
+
     ALTER TABLE cargas_importacao ADD COLUMN IF NOT EXISTS departamento TEXT;
     ALTER TABLE cargas_importacao ADD COLUMN IF NOT EXISTS filtro_data_ini DATE;
     ALTER TABLE cargas_importacao ADD COLUMN IF NOT EXISTS filtro_data_fim DATE;
@@ -632,6 +657,11 @@ def criar_tabelas_neon():
     ALTER TABLE pedidos_importados ADD COLUMN IF NOT EXISTS demanda TEXT;
     ALTER TABLE pedidos_liberados_historico ADD COLUMN IF NOT EXISTS departamento TEXT;
     ALTER TABLE pedidos_liberados_historico ADD COLUMN IF NOT EXISTS demanda TEXT;
+    ALTER TABLE pedidos_liberados_historico ADD COLUMN IF NOT EXISTS usuario_adicao TEXT;
+    ALTER TABLE pedidos_liberados_historico ADD COLUMN IF NOT EXISTS usuario_ultima_modificacao TEXT;
+    ALTER TABLE pedidos_liberados_historico ADD COLUMN IF NOT EXISTS ultima_modificacao_pedido TIMESTAMP DEFAULT NOW();
+    ALTER TABLE pedidos_importados ADD COLUMN IF NOT EXISTS usuario_importacao_pedido TEXT;
+    ALTER TABLE pedidos_removidos_importacao ADD COLUMN IF NOT EXISTS usuario_remocao TEXT;
     """
 
     try:
@@ -642,6 +672,175 @@ def criar_tabelas_neon():
         st.error("Erro ao criar/verificar tabelas no Neon.")
         st.code(str(e))
         return False
+
+
+
+# =========================================================
+# USUÁRIOS / LOGIN
+# =========================================================
+
+
+def hash_senha(senha):
+    senha_txt = str(senha or "")
+    return hashlib.sha256(("liberacao_pedidos|" + senha_txt).encode("utf-8")).hexdigest()
+
+
+def garantir_admin_padrao():
+    """Cria um ADMIN inicial se ainda não houver usuário cadastrado."""
+    engine = get_engine_neon()
+    if engine is None:
+        return False
+
+    try:
+        with engine.begin() as conn:
+            qtd = conn.execute(text("SELECT COUNT(*) FROM usuarios_sistema")).scalar() or 0
+            if qtd == 0:
+                conn.execute(
+                    text(
+                        """
+                        INSERT INTO usuarios_sistema (usuario, senha_hash, nome, perfil, analista, ativo)
+                        VALUES (:usuario, :senha_hash, :nome, 'ADMIN', NULL, TRUE)
+                        """
+                    ),
+                    {
+                        "usuario": "ADMIN",
+                        "senha_hash": hash_senha("123"),
+                        "nome": "Administrador",
+                    },
+                )
+        return True
+    except Exception as e:
+        st.error("Erro ao criar usuário ADMIN padrão.")
+        st.code(str(e))
+        return False
+
+
+def autenticar_usuario(usuario, senha):
+    engine = get_engine_neon()
+    if engine is None:
+        return None
+
+    try:
+        with engine.begin() as conn:
+            row = conn.execute(
+                text(
+                    """
+                    SELECT id, usuario, nome, perfil, analista, ativo
+                    FROM usuarios_sistema
+                    WHERE UPPER(usuario) = UPPER(:usuario)
+                      AND senha_hash = :senha_hash
+                      AND ativo = TRUE
+                    """
+                ),
+                {"usuario": limpar_texto(usuario), "senha_hash": hash_senha(senha)},
+            ).mappings().first()
+            return dict(row) if row else None
+    except Exception:
+        return None
+
+
+def listar_usuarios_sistema():
+    engine = get_engine_neon()
+    if engine is None:
+        return pd.DataFrame()
+
+    try:
+        with engine.begin() as conn:
+            return pd.read_sql(
+                """
+                SELECT id, usuario, nome, perfil, analista, ativo, criado_em, atualizado_em
+                FROM usuarios_sistema
+                ORDER BY nome
+                """,
+                conn,
+            )
+    except Exception:
+        return pd.DataFrame()
+
+
+def criar_usuario_sistema(usuario, senha, nome, perfil, analista=None):
+    engine = get_engine_neon()
+    if engine is None:
+        return False, "Neon não conectado."
+
+    usuario = limpar_texto(usuario).upper()
+    nome = limpar_texto(nome)
+    perfil = limpar_texto(perfil).upper()
+    analista = limpar_texto(analista) or None
+
+    if not usuario or not senha or not nome:
+        return False, "Preencha usuário, nome e senha."
+
+    try:
+        with engine.begin() as conn:
+            conn.execute(
+                text(
+                    """
+                    INSERT INTO usuarios_sistema (usuario, senha_hash, nome, perfil, analista, ativo)
+                    VALUES (:usuario, :senha_hash, :nome, :perfil, :analista, TRUE)
+                    """
+                ),
+                {
+                    "usuario": usuario,
+                    "senha_hash": hash_senha(senha),
+                    "nome": nome,
+                    "perfil": perfil,
+                    "analista": analista,
+                },
+            )
+        return True, "Usuário criado."
+    except Exception as e:
+        return False, str(e)
+
+
+def alterar_senha_usuario(usuario_id, nova_senha):
+    engine = get_engine_neon()
+    if engine is None:
+        return False, "Neon não conectado."
+    if not nova_senha:
+        return False, "Informe a nova senha."
+
+    try:
+        with engine.begin() as conn:
+            conn.execute(
+                text(
+                    """
+                    UPDATE usuarios_sistema
+                    SET senha_hash = :senha_hash, atualizado_em = NOW()
+                    WHERE id = :id
+                    """
+                ),
+                {"senha_hash": hash_senha(nova_senha), "id": int(usuario_id)},
+            )
+        return True, "Senha alterada."
+    except Exception as e:
+        return False, str(e)
+
+
+def definir_status_usuario(usuario_id, ativo):
+    engine = get_engine_neon()
+    if engine is None:
+        return False, "Neon não conectado."
+
+    try:
+        with engine.begin() as conn:
+            conn.execute(
+                text(
+                    """
+                    UPDATE usuarios_sistema
+                    SET ativo = :ativo, atualizado_em = NOW()
+                    WHERE id = :id
+                    """
+                ),
+                {"ativo": bool(ativo), "id": int(usuario_id)},
+            )
+        return True, "Usuário atualizado."
+    except Exception as e:
+        return False, str(e)
+
+
+def usuario_e_admin(usuario_logado):
+    return limpar_texto(usuario_logado.get("perfil", "")).upper() == "ADMIN"
 
 
 # =========================================================
@@ -912,10 +1111,10 @@ def salvar_carga_no_neon(
                         """
                         INSERT INTO pedidos_importados
                         (carga_id, pedido, fornecedor, loja, valor, status_banco, cod_status_banco,
-                         dados_planilha, departamento, nome_arquivo_origem, demanda)
+                         dados_planilha, departamento, nome_arquivo_origem, demanda, usuario_importacao_pedido)
                         VALUES
                         (:carga_id, :pedido, :fornecedor, :loja, :valor, :status_banco, :cod_status_banco,
-                         CAST(:dados_planilha AS JSONB), :departamento, :nome_arquivo_origem, :demanda)
+                         CAST(:dados_planilha AS JSONB), :departamento, :nome_arquivo_origem, :demanda, :usuario_importacao_pedido)
                         """
                     ),
                     {
@@ -930,6 +1129,7 @@ def salvar_carga_no_neon(
                         "departamento": depto_row,
                         "nome_arquivo_origem": nome_arq_row,
                         "demanda": demanda,
+                        "usuario_importacao_pedido": usuario_importacao,
                     },
                 )
 
@@ -956,10 +1156,12 @@ def salvar_carga_no_neon(
                             """
                             INSERT INTO pedidos_liberados_historico
                             (pedido, fornecedor, loja, valor, status_banco, cod_status_banco,
-                             primeira_carga, ultima_carga, dados_ultima_planilha, departamento, demanda)
+                             primeira_carga, ultima_carga, dados_ultima_planilha, departamento, demanda,
+                             usuario_adicao, usuario_ultima_modificacao, ultima_modificacao_pedido)
                             VALUES
                             (:pedido, :fornecedor, :loja, :valor, :status_banco, :cod_status_banco,
-                             :nome_carga, :nome_carga, CAST(:dados_planilha AS JSONB), :departamento, :demanda)
+                             :nome_carga, :nome_carga, CAST(:dados_planilha AS JSONB), :departamento, :demanda,
+                             :usuario_adicao, :usuario_ultima_modificacao, NOW())
                             ON CONFLICT (pedido, loja)
                             DO UPDATE SET
                                 fornecedor = EXCLUDED.fornecedor,
@@ -968,9 +1170,12 @@ def salvar_carga_no_neon(
                                 cod_status_banco = EXCLUDED.cod_status_banco,
                                 ultima_carga = EXCLUDED.ultima_carga,
                                 ultima_atualizacao = NOW(),
+                                ultima_modificacao_pedido = NOW(),
                                 dados_ultima_planilha = EXCLUDED.dados_ultima_planilha,
                                 departamento = EXCLUDED.departamento,
-                                demanda = EXCLUDED.demanda
+                                demanda = EXCLUDED.demanda,
+                                usuario_adicao = COALESCE(pedidos_liberados_historico.usuario_adicao, EXCLUDED.usuario_adicao),
+                                usuario_ultima_modificacao = EXCLUDED.usuario_ultima_modificacao
                             """
                         ),
                         {
@@ -984,6 +1189,8 @@ def salvar_carga_no_neon(
                             "dados_planilha": dados,
                             "departamento": depto_row,
                             "demanda": demanda,
+                            "usuario_adicao": usuario_importacao,
+                            "usuario_ultima_modificacao": usuario_importacao,
                         },
                     )
 
@@ -994,10 +1201,10 @@ def salvar_carga_no_neon(
                         text(
                             """
                             INSERT INTO pedidos_removidos_importacao
-                            (carga_id, nome_carga, nome_arquivo, usuario_importacao, pedido, fornecedor, loja,
+                            (carga_id, nome_carga, nome_arquivo, usuario_importacao, usuario_remocao, pedido, fornecedor, loja,
                              departamento, status_banco, cod_status_banco, dados_planilha)
                             VALUES
-                            (:carga_id, :nome_carga, :nome_arquivo, :usuario_importacao, :pedido, :fornecedor, :loja,
+                            (:carga_id, :nome_carga, :nome_arquivo, :usuario_importacao, :usuario_remocao, :pedido, :fornecedor, :loja,
                              :departamento, :status_banco, :cod_status_banco, CAST(:dados_planilha AS JSONB))
                             """
                         ),
@@ -1006,6 +1213,7 @@ def salvar_carga_no_neon(
                             "nome_carga": nome_carga,
                             "nome_arquivo": nome_arquivo,
                             "usuario_importacao": usuario_importacao,
+                            "usuario_remocao": usuario_importacao,
                             "pedido": limpar_texto(row.get(COLUNA_PEDIDO)),
                             "fornecedor": limpar_texto(row.get(COLUNA_FORNECEDOR)),
                             "loja": limpar_texto(row.get(COLUNA_LOJA)) or "GERAL",
@@ -1115,6 +1323,9 @@ def carregar_historico_liberados_neon():
                     demanda,
                     valor,
                     status_banco,
+                    COALESCE(usuario_adicao, '') AS usuario_adicao,
+                    COALESCE(usuario_ultima_modificacao, usuario_adicao, '') AS usuario_ultima_modificacao,
+                    COALESCE(ultima_modificacao_pedido, ultima_atualizacao) AS ultima_modificacao_pedido,
                     COALESCE(
                         dados_ultima_planilha ->> 'DATA_EMISSAO_ARQUIVO',
                         dados_ultima_planilha ->> 'DT_EMISSAO',
@@ -1208,10 +1419,10 @@ def carregar_historico_substituicoes_neon(nome_arquivo=None):
 
 def montar_historico_liberados_display(df):
     if df is None or df.empty:
-        return pd.DataFrame(columns=["Pedido", "Data", "Fornecedor", "Filial", "Departamento", "Tipo", "Valor", "Status", "Observação"])
+        return pd.DataFrame(columns=["Pedido", "Data", "Fornecedor", "Filial", "Departamento", "Tipo", "Valor", "Status", "Observação", "Adicionado por", "Última modificação"] )
 
     df = df.copy()
-    for col in ["pedido", "fornecedor", "loja", "departamento", "demanda", "valor", "status_banco", "observacao", "data_emissao_pedido", "data_historico"]:
+    for col in ["pedido", "fornecedor", "loja", "departamento", "demanda", "valor", "status_banco", "observacao", "data_emissao_pedido", "data_historico", "usuario_adicao", "usuario_ultima_modificacao", "ultima_modificacao_pedido"]:
         if col not in df.columns:
             df[col] = ""
 
@@ -1225,6 +1436,8 @@ def montar_historico_liberados_display(df):
         "Valor": df["valor"].apply(lambda v: formatar_moeda(limpar_valor(v) or 0)),
         "Status": df["status_banco"].apply(status_icone),
         "Observação": df["observacao"].apply(limpar_texto),
+        "Adicionado por": df["usuario_adicao"].apply(limpar_texto),
+        "Última modificação": df["ultima_modificacao_pedido"].apply(lambda v: formatar_data_hora_ddmmyyyy(v)),
     })
 
     return display
@@ -1274,20 +1487,21 @@ def montar_base_substituicao_historico(df_hist):
 def montar_historico_substituicoes_display(df_subs):
     if df_subs is None or df_subs.empty:
         return pd.DataFrame(columns=[
-            "Data", "Pedido antigo", "Fornecedor antigo", "Filial antiga", "Status antigo",
+            "Data", "Usuário", "Pedido antigo", "Fornecedor antigo", "Filial antiga", "Status antigo",
             "Pedido novo", "Fornecedor novo", "Filial nova", "Status novo", "Motivo", "Observação"
         ])
 
     df = df_subs.copy()
     for col in [
-        "data_registro", "pedido_antigo", "fornecedor_antigo", "loja_antiga", "status_antigo",
+        "data_registro", "usuario_registro", "pedido_antigo", "fornecedor_antigo", "loja_antiga", "status_antigo",
         "pedido_novo", "fornecedor_novo", "loja_nova", "status_novo", "motivo", "observacao"
     ]:
         if col not in df.columns:
             df[col] = ""
 
     display = pd.DataFrame({
-        "Data": df["data_registro"].apply(formatar_data_ddmmyyyy),
+        "Data": df["data_registro"].apply(formatar_data_hora_ddmmyyyy),
+        "Usuário": df["usuario_registro"].apply(limpar_texto),
         "Pedido antigo": df["pedido_antigo"].apply(limpar_texto),
         "Fornecedor antigo": df["fornecedor_antigo"].apply(limpar_texto),
         "Filial antiga": df["loja_antiga"].apply(limpar_texto),
@@ -1311,89 +1525,61 @@ st.markdown('<div class="titulo-principal">📦 Liberação de Pedidos</div>', u
 ok_neon, msg_neon = testar_conexao_neon()
 ok_api, msg_api = testar_conexao_api()
 
-with st.sidebar:
-    st.markdown("### 📦 Liberação")
-    usuario_importacao = st.text_input("Usuário", value="Vitoria")
+if not ok_neon:
+    st.error("Neon não conectado. Não é possível fazer login nem gravar histórico.")
+    st.caption(msg_neon)
+    st.stop()
 
-    if ok_neon:
-        criar_tabelas_neon()
+criar_tabelas_neon()
+garantir_admin_padrao()
 
-    # Mostra conexões apenas quando houver problema, para não poluir a lateral.
-    if not ok_neon or not ok_api:
-        st.divider()
-        st.header("Conexões")
+if "usuario_logado" not in st.session_state:
+    st.subheader("Entrar no sistema")
+    st.caption("O primeiro acesso padrão é usuário ADMIN e senha 123. Depois altere a senha na aba Usuários.")
+    with st.form("form_login"):
+        login_usuario = st.text_input("Usuário", value="ADMIN")
+        login_senha = st.text_input("Senha", type="password")
+        entrar = st.form_submit_button("Entrar", type="primary")
 
-        if not ok_neon:
-            st.error("Neon não conectado")
-            st.caption(msg_neon)
+    if entrar:
+        usuario_auth = autenticar_usuario(login_usuario, login_senha)
+        if usuario_auth:
+            st.session_state["usuario_logado"] = usuario_auth
+            st.rerun()
+        else:
+            st.error("Usuário ou senha inválidos, ou usuário inativo.")
+    st.stop()
 
-        if not ok_api:
-            st.error("API da empresa não conectada")
-            st.caption(msg_api)
+usuario_logado = st.session_state["usuario_logado"]
+usuario_importacao = limpar_texto(usuario_logado.get("nome")) or limpar_texto(usuario_logado.get("usuario"))
+perfil_logado = limpar_texto(usuario_logado.get("perfil", "ANALISTA")).upper()
+admin_logado = usuario_e_admin(usuario_logado)
 
-    st.divider()
-    st.markdown("### Resumo atual")
+col_user_info, col_sair = st.columns([5, 1])
+with col_user_info:
+    st.caption(f"Logado como: **{usuario_importacao}** | Perfil: **{perfil_logado}**")
+with col_sair:
+    if st.button("Sair"):
+        st.session_state.pop("usuario_logado", None)
+        st.rerun()
 
-    df_sidebar = preparar_df_pedidos(st.session_state.get("df_pedidos_empresa", pd.DataFrame()))
+if not ok_api:
+    st.warning("API da empresa não conectada. Você ainda consegue consultar o histórico, mas não consegue buscar novos pedidos.")
+    st.caption(msg_api)
 
-    if not df_sidebar.empty:
-        pedido_sidebar = df_sidebar[COLUNA_PEDIDO].nunique() if COLUNA_PEDIDO in df_sidebar.columns else len(df_sidebar)
-        liberado_sidebar = (
-            df_sidebar.loc[df_sidebar["STATUS_BANCO"] == "LIBERADO", COLUNA_PEDIDO].nunique()
-            if "STATUS_BANCO" in df_sidebar.columns and COLUNA_PEDIDO in df_sidebar.columns
-            else 0
-        )
-        bloqueado_sidebar = (
-            df_sidebar.loc[df_sidebar["STATUS_BANCO"] == "BLOQUEADO", COLUNA_PEDIDO].nunique()
-            if "STATUS_BANCO" in df_sidebar.columns and COLUNA_PEDIDO in df_sidebar.columns
-            else 0
-        )
-
-        valor_sidebar = 0.0
-        if COLUNA_VALOR in df_sidebar.columns:
-            for _, grupo_pedido_sidebar in df_sidebar.groupby([COLUNA_LOJA, COLUNA_FORNECEDOR, COLUNA_PEDIDO], dropna=False):
-                valor_sidebar += valor_pedido_tipo_fornecedor(grupo_pedido_sidebar)
-
-        st.caption("Importação carregada")
-        st.metric("Pedidos", int(pedido_sidebar))
-        st.metric("Liberados", int(liberado_sidebar))
-        st.metric("Bloqueados", int(bloqueado_sidebar))
-        st.metric("Valor Total", formatar_moeda(valor_sidebar))
-
-        demanda_sidebar = limpar_texto(st.session_state.get("tipo_demanda_importacao", ""))
-        arquivo_sidebar = limpar_texto(st.session_state.get("nome_arquivo_selecionado", ""))
-
-        if demanda_sidebar:
-            st.caption(f"Tipo: {demanda_sidebar.replace('DEMANDA ', '').title().replace('Juridica', 'Jurídica')}")
-        if arquivo_sidebar:
-            with st.expander("Arquivo(s)", expanded=False):
-                st.write(arquivo_sidebar)
-    else:
-        st.caption("Nenhuma importação carregada ainda.")
-        st.markdown(
-            """
-            **Fluxo rápido**
-
-            1. Busque os arquivos.  
-            2. Escolha um ou mais arquivos.  
-            3. Classifique a demanda.  
-            4. Remova pedidos errados, se precisar.  
-            5. Salve no Neon.
-            """
-        )
-
-    st.divider()
-    with st.expander("Atalhos", expanded=False):
-        st.caption("Link da tela na rede")
-        st.code("http://192.168.129.8:8501", language="text")
-        st.caption("API local")
-        st.code("http://localhost:8000", language="text")
-
-aba_consulta, aba_historico, aba_config = st.tabs([
+nomes_abas = [
     "🔎 Consultar banco da empresa",
     "📚 Histórico Neon",
     "⚙️ Configuração",
-])
+]
+if admin_logado:
+    nomes_abas.append("👥 Usuários")
+
+abas_app = st.tabs(nomes_abas)
+aba_consulta = abas_app[0]
+aba_historico = abas_app[1]
+aba_config = abas_app[2]
+aba_usuarios = abas_app[3] if admin_logado else None
 
 
 with aba_consulta:
@@ -1409,7 +1595,9 @@ with aba_consulta:
         data_fim = st.date_input("Data final", value=hoje, format="DD/MM/YYYY")
 
     with col_analista:
-        analista = st.selectbox("Analista", options=list(ANALISTAS.keys()))
+        analista_padrao_usuario = limpar_texto(usuario_logado.get("analista", ""))
+        idx_analista = list(ANALISTAS.keys()).index(analista_padrao_usuario) if analista_padrao_usuario in ANALISTAS else 0
+        analista = st.selectbox("Analista", options=list(ANALISTAS.keys()), index=idx_analista)
 
     departamentos_analista = ANALISTAS.get(analista, [])
     departamentos_selecionados = st.multiselect(
@@ -1748,18 +1936,20 @@ with aba_historico:
             data_padrao_ini = min(datas_validas) if datas_validas else date.today()
             data_padrao_fim = max(datas_validas) if datas_validas else date.today()
 
-            col_hist_1, col_hist_2, col_hist_3, col_hist_4, col_hist_5, col_hist_6 = st.columns([1, 1.2, 1, 1, 1, 1])
+            col_hist_1, col_hist_2, col_hist_3, col_hist_4, col_hist_5, col_hist_6, col_hist_7 = st.columns([1, 1.2, 1, 1, 1, 1, 1])
             with col_hist_1:
                 filtro_pedido_hist = st.text_input("Pedido", key="hist_filtro_pedido")
             with col_hist_2:
                 filtro_fornecedor_hist = st.text_input("Fornecedor", key="hist_filtro_fornecedor")
             with col_hist_3:
-                filtro_depto_hist = st.text_input("Departamento", key="hist_filtro_depto")
+                filtro_usuario_hist = st.text_input("Usuário", key="hist_filtro_usuario")
             with col_hist_4:
-                filtro_filial_hist = st.text_input("Filial", key="hist_filtro_filial")
+                filtro_depto_hist = st.text_input("Departamento", key="hist_filtro_depto")
             with col_hist_5:
-                data_hist_ini = st.date_input("Data inicial", value=data_padrao_ini, format="DD/MM/YYYY", key="hist_data_ini")
+                filtro_filial_hist = st.text_input("Filial", key="hist_filtro_filial")
             with col_hist_6:
+                data_hist_ini = st.date_input("Data inicial", value=data_padrao_ini, format="DD/MM/YYYY", key="hist_data_ini")
+            with col_hist_7:
                 data_hist_fim = st.date_input("Data final", value=data_padrao_fim, format="DD/MM/YYYY", key="hist_data_fim")
 
             if data_hist_ini > data_hist_fim:
@@ -1776,6 +1966,12 @@ with aba_historico:
                 df_hist = df_hist[df_hist["pedido"].astype(str).str.contains(filtro_pedido_hist, case=False, na=False)]
             if filtro_fornecedor_hist:
                 df_hist = df_hist[df_hist["fornecedor"].astype(str).str.contains(filtro_fornecedor_hist, case=False, na=False)]
+            if filtro_usuario_hist:
+                filtro_usuario_txt = str(filtro_usuario_hist)
+                df_hist = df_hist[
+                    df_hist.get("usuario_adicao", pd.Series(dtype=str)).astype(str).str.contains(filtro_usuario_txt, case=False, na=False)
+                    | df_hist.get("usuario_ultima_modificacao", pd.Series(dtype=str)).astype(str).str.contains(filtro_usuario_txt, case=False, na=False)
+                ]
             if filtro_depto_hist:
                 df_hist = df_hist[df_hist["departamento"].astype(str).str.contains(filtro_depto_hist, case=False, na=False)]
             if filtro_filial_hist:
@@ -1976,3 +2172,80 @@ requests
     st.warning(
         "Para testar localmente, deixe a API FastAPI rodando em outro terminal. Para a equipe usar na rede, rode o Streamlit com --server.address 0.0.0.0."
     )
+
+
+if admin_logado and aba_usuarios is not None:
+    with aba_usuarios:
+        st.subheader("Usuários do sistema")
+        st.caption("Somente ADMIN cria usuários, altera senha e ativa/desativa acesso.")
+
+        with st.expander("Criar novo usuário", expanded=True):
+            col_u1, col_u2, col_u3 = st.columns([1, 1.4, 1])
+            with col_u1:
+                novo_usuario = st.text_input("Usuário", key="novo_usuario")
+            with col_u2:
+                novo_nome = st.text_input("Nome", key="novo_nome")
+            with col_u3:
+                novo_perfil = st.selectbox("Perfil", options=["ANALISTA", "ADMIN"], key="novo_perfil")
+
+            col_u4, col_u5 = st.columns([1, 1])
+            with col_u4:
+                novo_analista = st.selectbox("Analista vinculado", options=[""] + list(ANALISTAS.keys()), key="novo_analista")
+            with col_u5:
+                nova_senha = st.text_input("Senha inicial", type="password", key="nova_senha")
+
+            if st.button("Criar usuário", type="primary"):
+                ok_criar, msg_criar = criar_usuario_sistema(novo_usuario, nova_senha, novo_nome, novo_perfil, novo_analista)
+                if ok_criar:
+                    st.success(msg_criar)
+                    st.rerun()
+                else:
+                    st.error(msg_criar)
+
+        df_usuarios = listar_usuarios_sistema()
+        if df_usuarios.empty:
+            st.info("Nenhum usuário cadastrado.")
+        else:
+            df_usuarios_display = df_usuarios.copy()
+            if "criado_em" in df_usuarios_display.columns:
+                df_usuarios_display["criado_em"] = df_usuarios_display["criado_em"].apply(formatar_data_hora_ddmmyyyy)
+            if "atualizado_em" in df_usuarios_display.columns:
+                df_usuarios_display["atualizado_em"] = df_usuarios_display["atualizado_em"].apply(formatar_data_hora_ddmmyyyy)
+            st.dataframe(df_usuarios_display, use_container_width=True, hide_index=True)
+
+            st.markdown("### Manutenção de usuário")
+            opcoes_usuarios = {
+                f"{row['id']} | {row['usuario']} | {row['nome']} | {row['perfil']} | {'ATIVO' if row['ativo'] else 'INATIVO'}": int(row["id"])
+                for _, row in df_usuarios.iterrows()
+            }
+            usuario_label = st.selectbox("Escolha o usuário", options=list(opcoes_usuarios.keys()))
+            usuario_id_sel = opcoes_usuarios.get(usuario_label)
+
+            col_m1, col_m2, col_m3 = st.columns([1, 1, 1])
+            with col_m1:
+                senha_redefinir = st.text_input("Nova senha", type="password", key="senha_redefinir")
+                if st.button("Alterar senha"):
+                    ok_senha, msg_senha = alterar_senha_usuario(usuario_id_sel, senha_redefinir)
+                    if ok_senha:
+                        st.success(msg_senha)
+                    else:
+                        st.error(msg_senha)
+            with col_m2:
+                if st.button("Ativar usuário"):
+                    ok_st, msg_st = definir_status_usuario(usuario_id_sel, True)
+                    if ok_st:
+                        st.success(msg_st)
+                        st.rerun()
+                    else:
+                        st.error(msg_st)
+            with col_m3:
+                if st.button("Desativar usuário"):
+                    if int(usuario_id_sel) == int(usuario_logado.get("id", -1)):
+                        st.error("Você não pode desativar o próprio usuário logado.")
+                    else:
+                        ok_st, msg_st = definir_status_usuario(usuario_id_sel, False)
+                        if ok_st:
+                            st.success(msg_st)
+                            st.rerun()
+                        else:
+                            st.error(msg_st)
