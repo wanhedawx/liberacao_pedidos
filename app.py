@@ -1604,10 +1604,32 @@ with aba_consulta:
         "Departamento",
         options=TODOS_DEPARTAMENTOS,
         default=departamentos_analista,
+        key=f"departamentos_consulta_{analista}",
         help="Multi seleção: os departamentos do analista já vêm marcados, mas você pode incluir/remover qualquer outro departamento.",
     )
 
     departamento_carga = "; ".join(departamentos_selecionados)
+
+    # Garante que a lista de arquivos exibida pertence ao analista/filtros atuais.
+    # Antes, se você buscava Cleviton e depois trocava para Jonatas, a tabela antiga
+    # continuava aparecendo até clicar em Buscar de novo.
+    assinatura_filtro_atual = {
+        "data_ini": data_ini.isoformat(),
+        "data_fim": data_fim.isoformat(),
+        "analista": analista,
+        "departamentos": sorted([limpar_texto(d).upper() for d in departamentos_selecionados]),
+    }
+
+    filtros_salvos = st.session_state.get("filtros_arquivos", {})
+    assinatura_salva = filtros_salvos.get("assinatura") if isinstance(filtros_salvos, dict) else None
+
+    if assinatura_salva and assinatura_salva != assinatura_filtro_atual:
+        st.session_state.pop("df_arquivos_empresa", None)
+        st.session_state.pop("df_pedidos_empresa", None)
+        st.session_state.pop("pedidos_remover_labels", None)
+        st.session_state.pop("nome_arquivo_selecionado", None)
+        st.session_state.pop("nomes_arquivos_selecionados", None)
+        st.session_state.pop("nome_carga", None)
 
     if data_ini > data_fim:
         st.error("A data inicial não pode ser maior que a data final.")
@@ -1635,6 +1657,7 @@ with aba_consulta:
                 "analista": analista,
                 "departamentos": departamentos_selecionados,
                 "departamento": departamento_carga,
+                "assinatura": assinatura_filtro_atual,
             }
             st.session_state.pop("df_pedidos_empresa", None)
             st.session_state.pop("pedidos_remover_labels", None)
